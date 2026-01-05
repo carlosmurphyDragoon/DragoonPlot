@@ -17,6 +17,9 @@ import struct
 import threading
 import time
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from collections import deque
 from typing import Optional, Union
@@ -25,6 +28,107 @@ from dataclasses import dataclass, field
 import dearpygui.dearpygui as dpg
 import serial
 import serial.tools.list_ports
+
+
+def get_linux_display_scale() -> float:
+    """
+    Detect the display scale factor on Linux.
+    Tries multiple methods in order of reliability.
+    """
+    # Method 1: Check environment variables (set by some desktop environments)
+    for env_var in ['GDK_SCALE', 'QT_SCALE_FACTOR', 'ELM_SCALE']:
+        scale = os.environ.get(env_var)
+        if scale:
+            try:
+                return float(scale)
+            except ValueError:
+                pass
+
+    # Method 2: Query GNOME/Mutter for the current display scale via D-Bus
+    try:
+        result = subprocess.run(
+            ['gdbus', 'call', '--session',
+             '--dest', 'org.gnome.Mutter.DisplayConfig',
+             '--object-path', '/org/gnome/Mutter/DisplayConfig',
+             '--method', 'org.gnome.Mutter.DisplayConfig.GetCurrentState'],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0:
+            # Parse the output to find scale factors
+            # The scale is in the logical monitors section, format: (x, y, scale, ...)
+            import re
+            # Look for the primary monitor's scale (the one with 'true' for is-primary)
+            # Pattern matches: (x, y, scale, uint32 N, true, ...)
+            matches = re.findall(r'\((\d+), (\d+), ([\d.]+), uint32 \d+, true,', result.stdout)
+            if matches:
+                return float(matches[0][2])
+            # If no primary found, try to get any scale > 1
+            matches = re.findall(r'\((\d+), (\d+), ([\d.]+), uint32 \d+,', result.stdout)
+            for match in matches:
+                scale = float(match[2])
+                if scale > 1.0:
+                    return scale
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        pass
+
+    # Method 3: Check gsettings for text scaling factor
+    try:
+        result = subprocess.run(
+            ['gsettings', 'get', 'org.gnome.desktop.interface', 'text-scaling-factor'],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0:
+            scale = float(result.stdout.strip())
+            if scale > 1.0:
+                return scale
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError, Exception):
+        pass
+
+    # Method 4: Check Xft.dpi from xrdb (X11)
+    try:
+        result = subprocess.run(
+            ['xrdb', '-query'],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0:
+            for line in result.stdout.split('\n'):
+                if 'Xft.dpi' in line:
+                    dpi = float(line.split(':')[1].strip())
+                    # Standard DPI is 96, calculate scale
+                    return dpi / 96.0
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError, Exception):
+        pass
+
+    return 1.0
+
+
+def get_windows_display_scale() -> float:
+    """Detect the display scale factor on Windows."""
+    try:
+        import ctypes
+        # Try to get DPI awareness context first
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # Per-monitor aware
+        except Exception:
+            pass
+        # Get the DPI for the primary monitor
+        hdc = ctypes.windll.user32.GetDC(0)
+        dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+        ctypes.windll.user32.ReleaseDC(0, hdc)
+        return dpi / 96.0
+    except Exception:
+        pass
+    return 1.0
+
+
+def get_display_scale() -> float:
+    """Get display scale factor for the current platform."""
+    if sys.platform == 'linux':
+        return get_linux_display_scale()
+    elif sys.platform == 'win32':
+        return get_windows_display_scale()
+    # macOS handles DPI scaling automatically
+    return 1.0
 
 # === Constants ===
 START_DATA = 0xAA
@@ -65,6 +169,24 @@ class CommandButton:
     label: str = "Cmd"
     data: str = ""
     mode: str = "ascii"  # "ascii" or "hex"
+
+
+# Default commands from GMU-RTOS serial_cmd.c
+DEFAULT_COMMAND_BUTTONS = [
+    # Diagnostics
+    CommandButton(label="Status", data="status\r\n", mode="ascii"),
+    CommandButton(label="AP", data="ap\r\n", mode="ascii"),
+    CommandButton(label="ECU", data="ecu\r\n", mode="ascii"),
+    CommandButton(label="ADC", data="adc\r\n", mode="ascii"),
+    CommandButton(label="Params", data="params\r\n", mode="ascii"),
+    CommandButton(label="ESCs", data="escs\r\n", mode="ascii"),
+    # State control
+    CommandButton(label="Reset", data="reset\r\n", mode="ascii"),
+    CommandButton(label="Idle", data="idle\r\n", mode="ascii"),
+    CommandButton(label="Run", data="run\r\n", mode="ascii"),
+    CommandButton(label="Output", data="output\r\n", mode="ascii"),
+    CommandButton(label="Help", data="help\r\n", mode="ascii"),
+]
 
 
 @dataclass
@@ -350,16 +472,24 @@ class DragoonPlotApp:
         self.time_window = self.config.time_window
         self.pending_labels: dict[int, str] = {}
         self.labels_updated = False
+        self.ui_scale = 1.0  # Will be set properly in _setup_gui
         self._setup_gui()
 
     def _load_config(self) -> AppConfig:
         if CONFIG_FILE.exists():
             try:
                 with open(CONFIG_FILE, 'r') as f:
-                    return AppConfig.from_dict(json.load(f))
+                    config = AppConfig.from_dict(json.load(f))
+                    # Use default buttons if none saved
+                    if not config.buttons:
+                        config.buttons = [CommandButton(b.label, b.data, b.mode) for b in DEFAULT_COMMAND_BUTTONS]
+                    return config
             except Exception as e:
                 print(f"Error loading config: {e}")
-        return AppConfig()
+        # Return default config with default command buttons
+        config = AppConfig()
+        config.buttons = [CommandButton(b.label, b.data, b.mode) for b in DEFAULT_COMMAND_BUTTONS]
+        return config
 
     def _save_config(self):
         self.config.last_port = self._get_selected_port()
@@ -457,6 +587,10 @@ class DragoonPlotApp:
             self.command_buttons.pop(idx)
             self._rebuild_command_buttons()
 
+    def _sz(self, value: int) -> int:
+        """Scale a size value by the UI scale factor."""
+        return int(value * self.ui_scale)
+
     def _rebuild_command_buttons(self):
         if dpg.does_item_exist("cmd_buttons_group"):
             dpg.delete_item("cmd_buttons_group", children_only=True)
@@ -465,18 +599,18 @@ class DragoonPlotApp:
                     dpg.add_button(
                         label=btn.label,
                         callback=lambda s, a, b=btn: self._send_command(b),
-                        width=80,
+                        width=self._sz(80),
                     )
                     dpg.add_input_text(
                         default_value=btn.label,
-                        width=60,
+                        width=self._sz(60),
                         callback=lambda s, a, b=btn: setattr(b, 'label', a),
                         on_enter=True,
                         hint="Label",
                     )
                     dpg.add_input_text(
                         default_value=btn.data,
-                        width=100,
+                        width=self._sz(100),
                         callback=lambda s, a, b=btn: setattr(b, 'data', a),
                         on_enter=True,
                         hint="Data",
@@ -484,19 +618,19 @@ class DragoonPlotApp:
                     dpg.add_combo(
                         items=["ascii", "hex"],
                         default_value=btn.mode,
-                        width=60,
+                        width=self._sz(60),
                         callback=lambda s, a, b=btn: setattr(b, 'mode', a),
                     )
                     dpg.add_button(
                         label="X",
                         callback=lambda s, a, idx=i: self._remove_command_button(idx),
-                        width=25,
+                        width=self._sz(25),
                     )
 
     def _rebuild_channel_controls(self):
         if dpg.does_item_exist("channel_controls_group"):
             dpg.delete_item("channel_controls_group", children_only=True)
-            for i, cfg in enumerate(self.channel_configs):
+            for cfg in self.channel_configs:
                 with dpg.group(horizontal=True, parent="channel_controls_group"):
                     dpg.add_checkbox(
                         default_value=cfg.visible,
@@ -507,36 +641,111 @@ class DragoonPlotApp:
                         callback=lambda s, a, c=cfg: setattr(c, 'color', (int(a[0]), int(a[1]), int(a[2]))),
                         no_alpha=True,
                         no_inputs=True,
-                        width=30,
+                        width=self._sz(30),
                     )
                     dpg.add_input_text(
                         default_value=cfg.name,
-                        width=70,
+                        width=self._sz(70),
                         callback=lambda s, a, c=cfg: setattr(c, 'name', a),
                         on_enter=True,
                     )
                     dpg.add_input_float(
                         default_value=cfg.scale,
-                        width=50,
+                        width=self._sz(50),
                         callback=lambda s, a, c=cfg: setattr(c, 'scale', a),
                         format="%.2f",
                         step=0,
                     )
                     dpg.add_input_float(
                         default_value=cfg.offset,
-                        width=50,
+                        width=self._sz(50),
                         callback=lambda s, a, c=cfg: setattr(c, 'offset', a),
                         format="%.1f",
                         step=0,
                     )
 
+    def _create_splitter_theme(self):
+        """Create a theme for the splitter bar."""
+        with dpg.theme() as theme:
+            with dpg.theme_component(dpg.mvButton):
+                dpg.add_theme_color(dpg.mvThemeCol_Button, (60, 60, 60, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (100, 100, 100, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (80, 80, 80, 255))
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 0)
+        return theme
+
+    def _on_mouse_down(self, sender, app_data):
+        """Track mouse down on splitter."""
+        if self.splitter_hovered:
+            self.splitter_dragging = True
+            # Store the initial mouse Y and panel height when drag starts
+            self.drag_start_mouse_y = dpg.get_mouse_pos(local=False)[1]
+            self.drag_start_panel_height = self.bottom_panel_height
+
+    def _on_mouse_release(self, sender, app_data):
+        """Track mouse release."""
+        self.splitter_dragging = False
+
+    def _update_splitter(self):
+        """Update splitter position based on current mouse position."""
+        if not self.splitter_dragging:
+            return
+
+        # Get current mouse Y position
+        current_mouse_y = dpg.get_mouse_pos(local=False)[1]
+
+        # Calculate delta from drag start
+        delta_y = current_mouse_y - self.drag_start_mouse_y
+
+        # Calculate new height (dragging down = smaller bottom panel)
+        new_height = self.drag_start_panel_height - delta_y
+
+        # Clamp to reasonable bounds
+        min_height = self._sz(100)
+        max_height = dpg.get_viewport_height() - self._sz(150)
+        new_height = max(min_height, min(new_height, max_height))
+
+        self.bottom_panel_height = new_height
+
+        # Update panel sizes
+        dpg.configure_item("graph_panel", height=-int(new_height + self._sz(12)))
+        dpg.configure_item("bottom_panel", height=int(new_height))
+
     def _setup_gui(self):
         dpg.create_context()
-        dpg.create_viewport(title="DragoonPlot", width=1200, height=700)
+
+        # Detect and apply display scaling for HiDPI support
+        self.ui_scale = get_display_scale()
+
+        # Scale viewport size
+        viewport_width = int(1200 * self.ui_scale)
+        viewport_height = int(700 * self.ui_scale)
+        dpg.create_viewport(title="DragoonPlot", width=viewport_width, height=viewport_height)
+
+        # Apply global font scaling for HiDPI displays
+        if self.ui_scale > 1.0:
+            dpg.set_global_font_scale(self.ui_scale)
+
+        # Helper to scale sizes
+        def sz(value):
+            return int(value * self.ui_scale)
+
+        # Store initial bottom panel height for splitter
+        self.bottom_panel_height = sz(170)
+        self.splitter_hovered = False
+        self.splitter_dragging = False
+        self.drag_start_mouse_y = 0
+        self.drag_start_panel_height = 0
+
+        # Register global mouse handlers for splitter dragging
+        with dpg.handler_registry(tag="global_handlers"):
+            dpg.add_mouse_click_handler(button=0, callback=self._on_mouse_down)
+            dpg.add_mouse_release_handler(button=0, callback=self._on_mouse_release)
 
         with dpg.window(tag="main_window"):
             # Top panel - Graph (takes most space)
-            with dpg.child_window(tag="graph_panel", height=-180):
+            with dpg.child_window(tag="graph_panel", height=sz(-182)):
                 with dpg.plot(
                     label="Serial Data",
                     tag="main_plot",
@@ -548,41 +757,45 @@ class DragoonPlotApp:
                     dpg.add_plot_axis(dpg.mvXAxis, label="Seconds", tag="x_axis")
                     dpg.add_plot_axis(dpg.mvYAxis, label="Value", tag="y_axis")
 
+            # Splitter bar - draggable divider
+            dpg.add_button(tag="splitter_bar", label="", height=sz(10), width=-1)
+            dpg.bind_item_theme("splitter_bar", self._create_splitter_theme())
+
             # Bottom panel - Controls
-            with dpg.child_window(tag="bottom_panel", height=170):
+            with dpg.child_window(tag="bottom_panel", height=sz(170)):
                 with dpg.group(horizontal=True):
                     # Connection section
-                    with dpg.group(width=220):
+                    with dpg.group(width=sz(220)):
                         dpg.add_text("Connection", color=(200, 200, 255))
                         with dpg.group(horizontal=True):
                             dpg.add_combo(
                                 tag="port_combo",
                                 items=[],
                                 default_value=self.config.last_port,
-                                width=120,
+                                width=sz(120),
                             )
-                            dpg.add_button(label="R", callback=self._refresh_ports, width=25)
+                            dpg.add_button(label="R", callback=self._refresh_ports, width=sz(25))
                         dpg.add_combo(
                             tag="baud_combo",
                             items=[str(b) for b in BAUD_RATES],
                             default_value=str(self.config.last_baud),
-                            width=145,
+                            width=sz(145),
                         )
                         with dpg.group(horizontal=True):
                             dpg.add_button(
                                 label="Connect",
                                 tag="connect_btn",
                                 callback=self._toggle_connection,
-                                width=70,
+                                width=sz(70),
                             )
-                            dpg.add_button(label="Clear", callback=self._clear_data, width=50)
-                            dpg.add_button(label="Save", callback=self._save_config, width=50)
+                            dpg.add_button(label="Clear", callback=self._clear_data, width=sz(50))
+                            dpg.add_button(label="Save", callback=self._save_config, width=sz(50))
                         dpg.add_text("Disconnected", tag="status_text", color=(255, 100, 100))
 
                     dpg.add_separator()
 
                     # Graph settings
-                    with dpg.group(width=150):
+                    with dpg.group(width=sz(150)):
                         dpg.add_text("X Axis Range", color=(200, 200, 255))
                         dpg.add_slider_float(
                             tag="time_slider",
@@ -590,13 +803,13 @@ class DragoonPlotApp:
                             min_value=1.0,
                             max_value=300.0,
                             callback=lambda s, a: setattr(self, 'time_window', a),
-                            width=140,
+                            width=sz(140),
                             format="%.0f sec",
                         )
                         dpg.add_input_float(
                             tag="time_input",
                             default_value=self.time_window,
-                            width=140,
+                            width=sz(140),
                             callback=self._on_time_input,
                             format="%.1f",
                             step=1.0,
@@ -605,9 +818,9 @@ class DragoonPlotApp:
                     dpg.add_separator()
 
                     # Channels section
-                    with dpg.group(width=350):
+                    with dpg.group(width=sz(350)):
                         dpg.add_text("Channels (Vis|Color|Name|Scale|Offset)", color=(200, 200, 255))
-                        with dpg.child_window(height=120, width=340):
+                        with dpg.child_window(tag="channels_window", height=-1, width=sz(340)):
                             dpg.add_group(tag="channel_controls_group")
 
                     dpg.add_separator()
@@ -616,8 +829,8 @@ class DragoonPlotApp:
                     with dpg.group():
                         with dpg.group(horizontal=True):
                             dpg.add_text("Commands", color=(200, 200, 255))
-                            dpg.add_button(label="+", callback=self._add_command_button, width=25)
-                        with dpg.child_window(height=120, width=-1):
+                            dpg.add_button(label="+", callback=self._add_command_button, width=sz(25))
+                        with dpg.child_window(tag="cmd_window", height=-1, width=-1):
                             dpg.add_group(tag="cmd_buttons_group")
 
         dpg.set_primary_window("main_window", True)
@@ -692,6 +905,13 @@ class DragoonPlotApp:
 
         while dpg.is_dearpygui_running():
             self._update_plot()
+
+            # Check if mouse is over splitter
+            if dpg.does_item_exist("splitter_bar"):
+                self.splitter_hovered = dpg.is_item_hovered("splitter_bar")
+
+            # Update splitter position if dragging
+            self._update_splitter()
 
             # Rebuild channel controls if new channels detected or labels updated
             current_count = len(self.channel_configs)
