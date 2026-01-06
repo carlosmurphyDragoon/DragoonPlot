@@ -137,7 +137,7 @@ MAX_CHANNELS = 32
 MAX_LABEL_LEN = 16
 BUFFER_SIZE = 10000
 DEFAULT_TIME_WINDOW = 10.0
-CONFIG_FILE = Path.home() / ".serial_monitor.json"
+CONFIG_FILE = Path.home() / ".dragoonplot.json"
 BAUD_RATES = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
 DEFAULT_COLORS = [
     (255, 87, 51),    # Red-orange
@@ -171,20 +171,25 @@ class CommandButton:
     mode: str = "ascii"  # "ascii" or "hex"
 
 
-# Default commands from GMU-RTOS serial_cmd.c
+# Default commands from GMU-RTOS serial_terminal.c
 DEFAULT_COMMAND_BUTTONS = [
+    # State control
+    CommandButton(label="Output", data="output\r\n", mode="ascii"),
+    CommandButton(label="Idle", data="idle\r\n", mode="ascii"),
+    CommandButton(label="Run", data="run\r\n", mode="ascii"),
+    CommandButton(label="Reset", data="reset\r\n", mode="ascii"),
+    CommandButton(label="Max", data="max\r\n", mode="ascii"),
+    CommandButton(label="EV", data="ev\r\n", mode="ascii"),
     # Diagnostics
     CommandButton(label="Status", data="status\r\n", mode="ascii"),
     CommandButton(label="AP", data="ap\r\n", mode="ascii"),
     CommandButton(label="ECU", data="ecu\r\n", mode="ascii"),
     CommandButton(label="ADC", data="adc\r\n", mode="ascii"),
+    CommandButton(label="CAN", data="can\r\n", mode="ascii"),
+    CommandButton(label="UART", data="uart\r\n", mode="ascii"),
     CommandButton(label="Params", data="params\r\n", mode="ascii"),
     CommandButton(label="ESCs", data="escs\r\n", mode="ascii"),
-    # State control
-    CommandButton(label="Reset", data="reset\r\n", mode="ascii"),
-    CommandButton(label="Idle", data="idle\r\n", mode="ascii"),
-    CommandButton(label="Run", data="run\r\n", mode="ascii"),
-    CommandButton(label="Output", data="output\r\n", mode="ascii"),
+    CommandButton(label="Perf", data="perf\r\n", mode="ascii"),
     CommandButton(label="Help", data="help\r\n", mode="ascii"),
 ]
 
@@ -407,17 +412,30 @@ class SerialManager:
 
     def _read_loop(self):
         """Background thread for reading serial data."""
+        bytes_received = 0
+        frames_parsed = 0
+        last_report = time.time()
         while self.running:
             try:
                 if self.port and self.port.in_waiting:
                     with self.lock:
                         data = self.port.read(self.port.in_waiting)
+                    bytes_received += len(data)
                     for byte_val in data:
                         result = self.parser.feed(byte_val)
                         if result is not None:
+                            frames_parsed += 1
                             self.on_data(result)
                 else:
                     time.sleep(0.001)
+                # Report stats every 2 seconds
+                now = time.time()
+                if now - last_report >= 2.0:
+                    if bytes_received > 0:
+                        print(f"Serial: {bytes_received} bytes, {frames_parsed} frames parsed")
+                    bytes_received = 0
+                    frames_parsed = 0
+                    last_report = now
             except Exception as e:
                 if self.running:
                     print(f"Read error: {e}")
@@ -505,6 +523,11 @@ class DragoonPlotApp:
 
     def _on_serial_data(self, values: list):
         """Callback for incoming serial data."""
+        if not hasattr(self, '_data_frame_count'):
+            self._data_frame_count = 0
+        self._data_frame_count += 1
+        if self._data_frame_count == 1:
+            print(f"First data frame: {len(values)} channels, values[0:5]={values[0:5]}")
         for i, val in enumerate(values):
             self.data_buffer.add_sample(i, val)
             if i >= len(self.channel_configs):
@@ -518,6 +541,7 @@ class DragoonPlotApp:
 
     def _on_labels(self, labels: dict):
         """Callback for incoming channel labels from MCU."""
+        print(f"Received labels for {len(labels)} channels: {list(labels.values())[:5]}...")
         for ch_idx, label in labels.items():
             self.pending_labels[ch_idx] = label
             if ch_idx < len(self.channel_configs):
@@ -566,6 +590,9 @@ class DragoonPlotApp:
             dpg.set_value("time_slider", self.time_window)
 
     def _send_command(self, button: CommandButton):
+        if button is None:
+            print("Error: button is None")
+            return
         if button.mode == "hex":
             try:
                 hex_str = button.data.replace("0x", "").replace(" ", "").replace(",", "")
@@ -598,20 +625,23 @@ class DragoonPlotApp:
                 with dpg.group(horizontal=True, parent="cmd_buttons_group"):
                     dpg.add_button(
                         label=btn.label,
-                        callback=lambda s, a, b=btn: self._send_command(b),
+                        callback=lambda s, a, u: self._send_command(u),
+                        user_data=btn,
                         width=self._sz(80),
                     )
                     dpg.add_input_text(
                         default_value=btn.label,
                         width=self._sz(60),
-                        callback=lambda s, a, b=btn: setattr(b, 'label', a),
+                        callback=lambda s, a, u: setattr(u, 'label', a),
+                        user_data=btn,
                         on_enter=True,
                         hint="Label",
                     )
                     dpg.add_input_text(
                         default_value=btn.data,
                         width=self._sz(100),
-                        callback=lambda s, a, b=btn: setattr(b, 'data', a),
+                        callback=lambda s, a, u: setattr(u, 'data', a),
+                        user_data=btn,
                         on_enter=True,
                         hint="Data",
                     )
@@ -619,11 +649,13 @@ class DragoonPlotApp:
                         items=["ascii", "hex"],
                         default_value=btn.mode,
                         width=self._sz(60),
-                        callback=lambda s, a, b=btn: setattr(b, 'mode', a),
+                        callback=lambda s, a, u: setattr(u, 'mode', a),
+                        user_data=btn,
                     )
                     dpg.add_button(
                         label="X",
-                        callback=lambda s, a, idx=i: self._remove_command_button(idx),
+                        callback=lambda s, a, u: self._remove_command_button(u),
+                        user_data=i,
                         width=self._sz(25),
                     )
 

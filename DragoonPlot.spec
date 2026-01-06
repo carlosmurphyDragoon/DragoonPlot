@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['serial_monitor.py'],
+    ['dragoonplot.py'],
     pathex=[],
     binaries=[],
     datas=[],
