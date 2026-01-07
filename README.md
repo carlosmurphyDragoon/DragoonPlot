@@ -8,7 +8,7 @@ A lightweight, portable serial plotter with real-time graphing. Single Python fi
 
 ```bash
 pip install dearpygui pyserial
-python serial_monitor.py
+python dragoonplot.py
 ```
 
 ### Option 2: Build Standalone Executable
@@ -37,16 +37,24 @@ The executable is fully self-contained with no dependencies.
 
 ```
 +------------------------------------------------------------------+
+|  [Graph] [Terminal]                                               |
 |                         Graph Area                                |
 |   (real-time scrolling plot, X axis: 0 to time_window seconds)   |
 +------------------------------------------------------------------+
+|  ═══════════════════ Draggable Splitter ════════════════════════ |
++------------------------------------------------------------------+
 | Connection | X Axis  | Channels              | Commands          |
-| [Port ▼][R]| Range   | [x] ■ Name Scale Off  | [Btn1] Label Data |
-| [Baud ▼]   | [slider]| [x] ■ Name Scale Off  | [Btn2] Label Data |
-| [Connect]  | [input] | ...                   | [+]               |
+| [Port ▼][R]| Range   | [x] ■ Name Scale Off  | [Discover]        |
+| [Baud ▼]   | [slider]| [x] ■ Name Scale Off  | [Cmd1] [Cmd2] ... |
+| [Connect]  | [input] | ...                   |                   |
 | [Clear]    |         |                       |                   |
 +------------------------------------------------------------------+
 ```
+
+- **Tabs**: Switch between Graph view and Terminal view
+- **Terminal**: Shows raw text output from serial port with auto-scroll
+- **Splitter**: Drag the horizontal bar to resize top/bottom panels
+- **Section dividers**: Drag vertical splitters to resize bottom panel sections
 
 ### Controls
 
@@ -72,25 +80,14 @@ Each channel row:
 
 ### Command Buttons
 
-- Click **+** to add a new button
-- Each button has:
-  - **Send button**: Click to transmit data
-  - **Label**: Button display name
-  - **Data**: Content to send
-  - **Mode**: `ascii` or `hex`
-- Click **X** to remove a button
-
-### Hex Format Examples
-
-```
-FF01          -> sends bytes 0xFF, 0x01
-0xFF 0x01     -> same
-FF,01         -> same
-```
+- Click **Discover** to auto-detect commands from the device (sends `help` command)
+- Commands are automatically grouped by category (State, Diagnostics, Parameters, System)
+- Click any command button to send it to the device
+- Discovered commands are saved to configuration
 
 ## Configuration
 
-Settings are saved to `~/.serial_monitor.json` and restored on startup:
+Settings are saved to `~/.dragoonplot.json` and restored on startup:
 - Last used port and baud rate
 - Channel names, colors, visibility, scale, offset
 - Command buttons
