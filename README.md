@@ -1,43 +1,54 @@
 # DragoonPlot
 
-A lightweight, portable serial plotter with real-time graphing. Single Python file, runs on Linux and Windows.
+A lightweight, portable serial plotter with real-time graphing and DFU firmware flashing. Single Python file, runs on Linux and Windows.
 
-## Installation
+## Quick Start - Build Executable
 
-### Option 1: Run from Source
+### Windows (One Command)
 
+**Prerequisites:** Python 3.8+ from [python.org](https://python.org) (check "Add Python to PATH" during install)
+
+```batch
+build.bat
+```
+
+That's it! The script automatically installs dependencies and creates `dist\DragoonPlot.exe`.
+
+### Linux
+
+```bash
+pip install dearpygui pyserial pyinstaller
+./build.sh
+./dist/DragoonPlot
+```
+
+## Run from Source (Development)
+
+```bash
+pip install -r requirements.txt
+python dragoonplot.py
+```
+
+Or manually:
 ```bash
 pip install dearpygui pyserial
 python dragoonplot.py
 ```
 
-### Option 2: Build Standalone Executable
+## Features
 
-Requires PyInstaller:
-
-```bash
-pip install dearpygui pyserial pyinstaller
-```
-
-**Linux:**
-```bash
-./build.sh
-./dist/DragoonPlot
-```
-
-**Windows:**
-```batch
-build.bat
-dist\DragoonPlot.exe
-```
-
-The executable is fully self-contained with no dependencies.
+- **Real-time plotting** of serial data with configurable time window
+- **Terminal view** for raw serial output
+- **DFU flashing** for STM32 devices (dfu-util bundled on Windows)
+- **Command discovery** - auto-detects device commands via `help`
+- **Configurable channels** - visibility, colors, scale, offset
+- **HiDPI support** - automatic scaling on high-resolution displays
 
 ## Interface
 
 ```
 +------------------------------------------------------------------+
-|  [Graph] [Terminal]                                               |
+|  [Graph] [Terminal] [DFU]                                         |
 |                         Graph Area                                |
 |   (real-time scrolling plot, X axis: 0 to time_window seconds)   |
 +------------------------------------------------------------------+
@@ -51,10 +62,10 @@ The executable is fully self-contained with no dependencies.
 +------------------------------------------------------------------+
 ```
 
-- **Tabs**: Switch between Graph view and Terminal view
-- **Terminal**: Shows raw text output from serial port with auto-scroll
-- **Splitter**: Drag the horizontal bar to resize top/bottom panels
-- **Section dividers**: Drag vertical splitters to resize bottom panel sections
+### Tabs
+- **Graph**: Real-time scrolling plot
+- **Terminal**: Raw text output with auto-scroll
+- **DFU**: Firmware flashing for STM32 devices
 
 ### Controls
 
@@ -64,26 +75,20 @@ The executable is fully self-contained with no dependencies.
 - **Clear**: Clear all graph data
 - **Save**: Save current configuration
 
-### Graph Settings
+### DFU Flashing
 
-- **X Axis Range**: Time window in seconds (1-300s / 5 minutes max)
-- Slider for quick adjustment, input field for precise values
+1. Click **Browse** to select a `.bin` firmware file
+2. Set the target address (default: `0x08004000` for 2nd sector)
+3. Click **Enter DFU** to put device in bootloader mode
+4. Click **Flash** to program the firmware
 
-### Channel Configuration
-
-Each channel row:
-- **Checkbox**: Show/hide channel on graph
-- **Color square**: Click to change line color
-- **Name**: Editable channel label
-- **Scale**: Multiply values by this factor
-- **Offset**: Add this value after scaling
+**Note:** Windows users need to install the WinUSB driver via [Zadig](https://zadig.akeo.ie/) for the STM32 DFU device.
 
 ### Command Buttons
 
 - Click **Discover** to auto-detect commands from the device (sends `help` command)
 - Commands are automatically grouped by category (State, Diagnostics, Parameters, System)
 - Click any command button to send it to the device
-- Discovered commands are saved to configuration
 
 ## Configuration
 
@@ -92,6 +97,7 @@ Settings are saved to `~/.dragoonplot.json` and restored on startup:
 - Channel names, colors, visibility, scale, offset
 - Command buttons
 - Time window
+- Last DFU file path
 
 ## Protocol
 
