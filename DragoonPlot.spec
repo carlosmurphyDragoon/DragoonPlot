@@ -11,11 +11,19 @@ if sys.platform == 'win32':
     if os.path.exists('libusb-1.0.dll'):
         dfu_datas.append(('libusb-1.0.dll', '.'))
 
+# Bundle branding assets
+branding_datas = []
+if os.path.exists('branding'):
+    branding_datas.append(('branding', 'branding'))
+
+# Icon path for executable
+icon_path = 'branding/Dragoon-icon.ico' if os.path.exists('branding/Dragoon-icon.ico') else None
+
 a = Analysis(
     ['dragoonplot.py'],
     pathex=[],
     binaries=[],
-    datas=dfu_datas,
+    datas=dfu_datas + branding_datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -36,13 +44,14 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=icon_path,
 )

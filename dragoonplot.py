@@ -146,6 +146,17 @@ def get_dfu_util_path() -> str:
     return 'dfu-util'
 
 
+def get_resource_path(relative_path: str) -> str:
+    """Get path to bundled resource (works in both dev and PyInstaller bundle)."""
+    if getattr(sys, 'frozen', False):
+        # Running as PyInstaller bundle
+        base_path = sys._MEIPASS
+    else:
+        # Running as script
+        base_path = os.path.dirname(__file__)
+    return os.path.join(base_path, relative_path)
+
+
 # === Constants ===
 START_DATA = 0xAA
 START_LABEL = 0xAB
@@ -1132,7 +1143,19 @@ class DragoonPlotApp:
         # Scale viewport size
         viewport_width = int(1200 * self.ui_scale)
         viewport_height = int(700 * self.ui_scale)
-        dpg.create_viewport(title="DragoonPlot", width=viewport_width, height=viewport_height)
+
+        # Get icon path for viewport
+        icon_path = get_resource_path('branding/Dragoon-icon.ico')
+        if not os.path.exists(icon_path):
+            icon_path = None
+
+        dpg.create_viewport(
+            title="DragoonPlot",
+            width=viewport_width,
+            height=viewport_height,
+            small_icon=icon_path,
+            large_icon=icon_path,
+        )
 
         # Apply global font scaling for HiDPI displays
         if self.ui_scale > 1.0:
