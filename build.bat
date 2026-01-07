@@ -18,7 +18,7 @@ if exist __pycache__ rmdir /s /q __pycache__
 
 REM Build
 echo Building executable...
-pyinstaller serial_monitor.spec
+pyinstaller DragoonPlot.spec
 
 REM Check result
 if exist "dist\DragoonPlot.exe" (

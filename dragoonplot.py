@@ -169,29 +169,11 @@ class CommandButton:
     label: str = "Cmd"
     data: str = ""
     mode: str = "ascii"  # "ascii" or "hex"
+    category: str = ""  # Category from help output (state, diag, param, sys)
 
 
-# Default commands from GMU-RTOS serial_terminal.c
-DEFAULT_COMMAND_BUTTONS = [
-    # State control
-    CommandButton(label="Output", data="output\r\n", mode="ascii"),
-    CommandButton(label="Idle", data="idle\r\n", mode="ascii"),
-    CommandButton(label="Run", data="run\r\n", mode="ascii"),
-    CommandButton(label="Reset", data="reset\r\n", mode="ascii"),
-    CommandButton(label="Max", data="max\r\n", mode="ascii"),
-    CommandButton(label="EV", data="ev\r\n", mode="ascii"),
-    # Diagnostics
-    CommandButton(label="Status", data="status\r\n", mode="ascii"),
-    CommandButton(label="AP", data="ap\r\n", mode="ascii"),
-    CommandButton(label="ECU", data="ecu\r\n", mode="ascii"),
-    CommandButton(label="ADC", data="adc\r\n", mode="ascii"),
-    CommandButton(label="CAN", data="can\r\n", mode="ascii"),
-    CommandButton(label="UART", data="uart\r\n", mode="ascii"),
-    CommandButton(label="Params", data="params\r\n", mode="ascii"),
-    CommandButton(label="ESCs", data="escs\r\n", mode="ascii"),
-    CommandButton(label="Perf", data="perf\r\n", mode="ascii"),
-    CommandButton(label="Help", data="help\r\n", mode="ascii"),
-]
+# Default commands (empty - use Discover to populate from device)
+DEFAULT_COMMAND_BUTTONS = []
 
 
 @dataclass
@@ -212,7 +194,7 @@ class AppConfig:
                 for c in self.channels
             ],
             "buttons": [
-                {"label": b.label, "data": b.data, "mode": b.mode}
+                {"label": b.label, "data": b.data, "mode": b.mode, "category": b.category}
                 for b in self.buttons
             ],
             "time_window": self.time_window,
@@ -238,6 +220,7 @@ class AppConfig:
                 label=b.get("label", "Cmd"),
                 data=b.get("data", ""),
                 mode=b.get("mode", "ascii"),
+                category=b.get("category", ""),
             )
             for b in d.get("buttons", [])
         ]
@@ -264,16 +247,30 @@ class BinaryProtocolParser:
         self.channel_count = 0
         self.data_bytes = bytearray()
         self.expected_data_len = 0
+        self.frame_start_time = 0
+
+    def check_timeout(self):
+        """Reset parser if frame takes too long (protects against false starts)."""
+        if self.state != "WAIT_START" and self.frame_start_time > 0:
+            if time.time() - self.frame_start_time > 0.1:  # 100ms timeout
+                self.reset()
+                return True
+        return False
 
     def feed(self, byte_val: int) -> Optional[list]:
         """Feed a byte. Returns parsed values for data frames, None otherwise."""
+        # Check for frame timeout
+        self.check_timeout()
+
         if self.state == "WAIT_START":
             if byte_val == START_DATA:
                 self.frame_type = "DATA"
                 self.state = "READ_COUNT"
+                self.frame_start_time = time.time()
             elif byte_val == START_LABEL:
                 self.frame_type = "LABEL"
                 self.state = "READ_COUNT"
+                self.frame_start_time = time.time()
             return None
 
         elif self.state == "READ_COUNT":
@@ -357,13 +354,15 @@ class BinaryProtocolParser:
 class SerialManager:
     """Threaded serial port manager."""
 
-    def __init__(self, on_data_callback, on_labels_callback=None):
+    def __init__(self, on_data_callback, on_labels_callback=None, on_text_callback=None):
         self.port: Optional[serial.Serial] = None
         self.thread: Optional[threading.Thread] = None
         self.running = False
         self.on_data = on_data_callback
+        self.on_text = on_text_callback
         self.parser = BinaryProtocolParser(on_labels_callback)
         self.lock = threading.Lock()
+        self.text_buffer = bytearray()
 
     @staticmethod
     def list_ports() -> list:
@@ -375,7 +374,19 @@ class SerialManager:
         """Connect to serial port."""
         self.disconnect()
         try:
-            self.port = serial.Serial(port_name, baud_rate, timeout=0.1)
+            # Use larger read buffer and disable flow control for USB CDC
+            self.port = serial.Serial(
+                port_name,
+                baud_rate,
+                timeout=0.05,
+                write_timeout=1.0,
+                xonxoff=False,
+                rtscts=False,
+                dsrdtr=False
+            )
+            # Set RTS high to signal ready-to-receive (important for some USB CDC)
+            self.port.rts = True
+            self.port.dtr = True
             self.running = True
             self.parser.reset()
             self.thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -417,17 +428,49 @@ class SerialManager:
         last_report = time.time()
         while self.running:
             try:
-                if self.port and self.port.in_waiting:
-                    with self.lock:
-                        data = self.port.read(self.port.in_waiting)
-                    bytes_received += len(data)
-                    for byte_val in data:
-                        result = self.parser.feed(byte_val)
-                        if result is not None:
-                            frames_parsed += 1
-                            self.on_data(result)
+                if not self.port:
+                    time.sleep(0.01)
+                    continue
+
+                # Read available data - use read(1) with timeout as fallback
+                # This helps with USB CDC flow control
+                waiting = self.port.in_waiting
+                if waiting > 0:
+                    data = self.port.read(waiting)
                 else:
-                    time.sleep(0.001)
+                    # Do a blocking read with short timeout to trigger USB polling
+                    data = self.port.read(1)
+                    if not data:
+                        continue
+
+                bytes_received += len(data)
+
+                for byte_val in data:
+                    # Always try to collect printable ASCII as text first
+                    # This runs in parallel with binary parsing
+                    if self.on_text:
+                        if byte_val == 0x0A:  # LF - end of line
+                            if self.text_buffer:
+                                try:
+                                    line = self.text_buffer.decode('utf-8', errors='replace').strip()
+                                    if line:
+                                        self.on_text(line)
+                                except:
+                                    pass
+                                self.text_buffer = bytearray()
+                        elif byte_val == 0x0D:  # CR - ignore
+                            pass
+                        elif 0x20 <= byte_val < 0x7F or byte_val == 0x09:  # Printable or tab
+                            self.text_buffer.append(byte_val)
+                            # Limit buffer size (increased for long help lines)
+                            if len(self.text_buffer) > 1024:
+                                self.text_buffer = bytearray()
+
+                    # Also feed to binary parser
+                    result = self.parser.feed(byte_val)
+                    if result is not None:
+                        frames_parsed += 1
+                        self.on_data(result)
                 # Report stats every 2 seconds
                 now = time.time()
                 if now - last_report >= 2.0:
@@ -484,13 +527,18 @@ class DragoonPlotApp:
     def __init__(self):
         self.config = self._load_config()
         self.data_buffer = DataBuffer()
-        self.serial_manager = SerialManager(self._on_serial_data, self._on_labels)
+        self.serial_manager = SerialManager(self._on_serial_data, self._on_labels, self._on_text_line)
         self.channel_configs: list[ChannelConfig] = list(self.config.channels)
         self.command_buttons: list[CommandButton] = list(self.config.buttons)
         self.time_window = self.config.time_window
         self.pending_labels: dict[int, str] = {}
         self.labels_updated = False
         self.ui_scale = 1.0  # Will be set properly in _setup_gui
+        self.help_parsing = False  # Flag to indicate we're parsing help output
+        self.parsed_commands: list[CommandButton] = []  # Commands parsed from help
+        self.commands_updated = False  # Flag to rebuild command buttons
+        self.terminal_queue: list[str] = []  # Queue for terminal output (thread-safe)
+        self.terminal_lock = threading.Lock()
         self._setup_gui()
 
     def _load_config(self) -> AppConfig:
@@ -545,8 +593,70 @@ class DragoonPlotApp:
         for ch_idx, label in labels.items():
             self.pending_labels[ch_idx] = label
             if ch_idx < len(self.channel_configs):
-                self.channel_configs[ch_idx].name = label
-                self.labels_updated = True
+                # Only mark as updated if the label actually changed
+                if self.channel_configs[ch_idx].name != label:
+                    self.channel_configs[ch_idx].name = label
+                    self.labels_updated = True
+
+    def _on_text_line(self, line: str):
+        """Callback for incoming text lines from serial port."""
+        # Queue text for terminal output (called from serial thread)
+        with self.terminal_lock:
+            self.terminal_queue.append(line)
+
+        # Check for help output start
+        if "GMU Commands" in line:
+            self.help_parsing = True
+            self.parsed_commands = []
+            self.help_parse_start_time = time.time()
+            self.help_last_line_time = time.time()
+            return
+
+        # Check for help output end (separator line at end, or "help" command itself)
+        if self.help_parsing:
+            # Update last line time whenever we receive a line
+            self.help_last_line_time = time.time()
+
+            # End on closing separator or on "help" line (last command in list)
+            if line.startswith("---------+") or ("|" in line and "help" in line.lower() and "sys" in line.lower()):
+                if self.parsed_commands:
+                    self.help_parsing = False
+                    self.command_buttons = self.parsed_commands
+                    self.commands_updated = True
+                return
+
+        # Parse command lines during help output
+        if self.help_parsing and "|" in line:
+            # Format: "CMD      | ARGS     | CAT   | DESCRIPTION"
+            # Skip header line
+            if "CMD" in line and "ARGS" in line:
+                return
+
+            parts = [p.strip() for p in line.split("|")]
+            print(f"DEBUG: parts={parts}, len={len(parts)}")
+            if len(parts) >= 3:
+                cmd = parts[0].strip()
+                args = parts[1].strip()
+                cat = parts[2].strip()
+                print(f"DEBUG: cmd={cmd}, args={args}, cat={cat}")
+
+                # Only add commands without arguments (ARGS == "-")
+                if cmd and args == "-":
+                    btn = CommandButton(
+                        label=cmd.capitalize(),
+                        data=f"{cmd}\r\n",
+                        mode="ascii",
+                        category=cat
+                    )
+                    self.parsed_commands.append(btn)
+                    print(f"DEBUG: Added command {cmd}")
+
+    def _discover_commands(self):
+        """Send help command to discover available commands."""
+        if self.serial_manager.is_connected():
+            self.help_parsing = False
+            self.parsed_commands = []
+            self.serial_manager.send(b"help\r\n")
 
     def _get_selected_port(self) -> str:
         if dpg.does_item_exist("port_combo"):
@@ -583,6 +693,42 @@ class DragoonPlotApp:
     def _clear_data(self):
         self.data_buffer.clear()
 
+    def _clear_terminal(self):
+        """Clear the terminal output."""
+        if dpg.does_item_exist("terminal_output"):
+            dpg.set_value("terminal_output", "")
+
+    def _process_terminal_queue(self):
+        """Process queued terminal output (must be called from main thread)."""
+        if not dpg.does_item_exist("terminal_output"):
+            return
+
+        # Get all queued lines
+        with self.terminal_lock:
+            if not self.terminal_queue:
+                return
+            lines = self.terminal_queue.copy()
+            self.terminal_queue.clear()
+
+        # Append to terminal
+        current = dpg.get_value("terminal_output")
+        new_text = current + "\n".join(lines) + "\n"
+
+        # Limit terminal buffer to ~50KB to prevent memory issues
+        max_len = 50000
+        if len(new_text) > max_len:
+            new_text = new_text[-max_len:]
+        dpg.set_value("terminal_output", new_text)
+
+        # Auto-scroll to bottom if enabled
+        if dpg.does_item_exist("terminal_autoscroll") and dpg.get_value("terminal_autoscroll"):
+            # Scroll the child_window container to bottom
+            try:
+                max_scroll = dpg.get_y_scroll_max("terminal_scroll_container")
+                dpg.set_y_scroll("terminal_scroll_container", max_scroll)
+            except Exception:
+                pass
+
     def _on_time_input(self, sender, value):
         """Handle manual time window input."""
         if value > 0:
@@ -604,16 +750,6 @@ class DragoonPlotApp:
             data = button.data.encode('utf-8')
         self.serial_manager.send(data)
 
-    def _add_command_button(self):
-        btn = CommandButton(label=f"Btn{len(self.command_buttons)}", data="", mode="ascii")
-        self.command_buttons.append(btn)
-        self._rebuild_command_buttons()
-
-    def _remove_command_button(self, idx: int):
-        if 0 <= idx < len(self.command_buttons):
-            self.command_buttons.pop(idx)
-            self._rebuild_command_buttons()
-
     def _sz(self, value: int) -> int:
         """Scale a size value by the UI scale factor."""
         return int(value * self.ui_scale)
@@ -621,56 +757,96 @@ class DragoonPlotApp:
     def _rebuild_command_buttons(self):
         if dpg.does_item_exist("cmd_buttons_group"):
             dpg.delete_item("cmd_buttons_group", children_only=True)
+
+            # Group buttons by category
+            categories = {}
+            uncategorized = []
             for i, btn in enumerate(self.command_buttons):
+                if btn.category:
+                    if btn.category not in categories:
+                        categories[btn.category] = []
+                    categories[btn.category].append((i, btn))
+                else:
+                    uncategorized.append((i, btn))
+
+            # Category display names and order
+            cat_names = {
+                "state": "State",
+                "diag": "Diagnostics",
+                "param": "Parameters",
+                "sys": "System"
+            }
+            cat_order = ["state", "diag", "param", "sys"]
+
+            # Render categorized buttons
+            for cat in cat_order:
+                if cat in categories:
+                    # Category header
+                    dpg.add_text(cat_names.get(cat, cat.capitalize()),
+                                color=(150, 200, 255), parent="cmd_buttons_group")
+                    # Buttons in a horizontal flow
+                    with dpg.group(horizontal=True, parent="cmd_buttons_group"):
+                        for i, btn in categories[cat]:
+                            dpg.add_button(
+                                label=btn.label,
+                                callback=lambda s, a, u: self._send_command(u),
+                                user_data=btn,
+                                width=self._sz(70),
+                            )
+                    dpg.add_spacer(height=5, parent="cmd_buttons_group")
+
+            # Render any uncategorized buttons as simple buttons
+            if uncategorized:
+                if categories:
+                    dpg.add_text("Other", color=(150, 200, 255), parent="cmd_buttons_group")
                 with dpg.group(horizontal=True, parent="cmd_buttons_group"):
-                    dpg.add_button(
-                        label=btn.label,
-                        callback=lambda s, a, u: self._send_command(u),
-                        user_data=btn,
-                        width=self._sz(80),
-                    )
-                    dpg.add_input_text(
-                        default_value=btn.label,
-                        width=self._sz(60),
-                        callback=lambda s, a, u: setattr(u, 'label', a),
-                        user_data=btn,
-                        on_enter=True,
-                        hint="Label",
-                    )
-                    dpg.add_input_text(
-                        default_value=btn.data,
-                        width=self._sz(100),
-                        callback=lambda s, a, u: setattr(u, 'data', a),
-                        user_data=btn,
-                        on_enter=True,
-                        hint="Data",
-                    )
-                    dpg.add_combo(
-                        items=["ascii", "hex"],
-                        default_value=btn.mode,
-                        width=self._sz(60),
-                        callback=lambda s, a, u: setattr(u, 'mode', a),
-                        user_data=btn,
-                    )
-                    dpg.add_button(
-                        label="X",
-                        callback=lambda s, a, u: self._remove_command_button(u),
-                        user_data=i,
-                        width=self._sz(25),
-                    )
+                    for i, btn in uncategorized:
+                        dpg.add_button(
+                            label=btn.label,
+                            callback=lambda s, a, u: self._send_command(u),
+                            user_data=btn,
+                            width=self._sz(70),
+                        )
+
+    def _on_channel_visible(self, sender, value, user_data):
+        idx = user_data
+        if 0 <= idx < len(self.channel_configs):
+            self.channel_configs[idx].visible = value
+
+    def _on_channel_color(self, sender, value, user_data):
+        idx = user_data
+        if 0 <= idx < len(self.channel_configs):
+            self.channel_configs[idx].color = (int(value[0]), int(value[1]), int(value[2]))
+
+    def _on_channel_name(self, sender, value, user_data):
+        idx = user_data
+        if 0 <= idx < len(self.channel_configs):
+            self.channel_configs[idx].name = value
+
+    def _on_channel_scale(self, sender, value, user_data):
+        idx = user_data
+        if 0 <= idx < len(self.channel_configs):
+            self.channel_configs[idx].scale = value
+
+    def _on_channel_offset(self, sender, value, user_data):
+        idx = user_data
+        if 0 <= idx < len(self.channel_configs):
+            self.channel_configs[idx].offset = value
 
     def _rebuild_channel_controls(self):
         if dpg.does_item_exist("channel_controls_group"):
             dpg.delete_item("channel_controls_group", children_only=True)
-            for cfg in self.channel_configs:
+            for i, cfg in enumerate(self.channel_configs):
                 with dpg.group(horizontal=True, parent="channel_controls_group"):
                     dpg.add_checkbox(
                         default_value=cfg.visible,
-                        callback=lambda s, a, c=cfg: setattr(c, 'visible', a),
+                        callback=self._on_channel_visible,
+                        user_data=i,
                     )
                     dpg.add_color_edit(
                         default_value=(*cfg.color, 255),
-                        callback=lambda s, a, c=cfg: setattr(c, 'color', (int(a[0]), int(a[1]), int(a[2]))),
+                        callback=self._on_channel_color,
+                        user_data=i,
                         no_alpha=True,
                         no_inputs=True,
                         width=self._sz(30),
@@ -678,26 +854,31 @@ class DragoonPlotApp:
                     dpg.add_input_text(
                         default_value=cfg.name,
                         width=self._sz(70),
-                        callback=lambda s, a, c=cfg: setattr(c, 'name', a),
+                        callback=self._on_channel_name,
+                        user_data=i,
                         on_enter=True,
                     )
                     dpg.add_input_float(
                         default_value=cfg.scale,
                         width=self._sz(50),
-                        callback=lambda s, a, c=cfg: setattr(c, 'scale', a),
+                        callback=self._on_channel_scale,
+                        user_data=i,
                         format="%.2f",
                         step=0,
+                        on_enter=True,
                     )
                     dpg.add_input_float(
                         default_value=cfg.offset,
                         width=self._sz(50),
-                        callback=lambda s, a, c=cfg: setattr(c, 'offset', a),
+                        callback=self._on_channel_offset,
+                        user_data=i,
                         format="%.1f",
                         step=0,
+                        on_enter=True,
                     )
 
     def _create_splitter_theme(self):
-        """Create a theme for the splitter bar."""
+        """Create a theme for the horizontal splitter bar."""
         with dpg.theme() as theme:
             with dpg.theme_component(dpg.mvButton):
                 dpg.add_theme_color(dpg.mvThemeCol_Button, (60, 60, 60, 255))
@@ -707,17 +888,34 @@ class DragoonPlotApp:
                 dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 0)
         return theme
 
+    def _create_vsplitter_theme(self):
+        """Create a theme for the vertical splitter bar."""
+        with dpg.theme() as theme:
+            with dpg.theme_component(dpg.mvButton):
+                dpg.add_theme_color(dpg.mvThemeCol_Button, (50, 50, 50, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (100, 100, 100, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (80, 80, 80, 255))
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 0)
+        return theme
+
     def _on_mouse_down(self, sender, app_data):
         """Track mouse down on splitter."""
+        # Check horizontal splitter first
         if self.splitter_hovered:
             self.splitter_dragging = True
-            # Store the initial mouse Y and panel height when drag starts
             self.drag_start_mouse_y = dpg.get_mouse_pos(local=False)[1]
             self.drag_start_panel_height = self.bottom_panel_height
+        # Check vertical splitters
+        elif self.h_splitter_hovered is not None:
+            self.h_splitter_dragging = self.h_splitter_hovered
+            self.h_drag_start_mouse_x = dpg.get_mouse_pos(local=False)[0]
+            self.h_drag_start_widths = list(self.section_widths)
 
     def _on_mouse_release(self, sender, app_data):
         """Track mouse release."""
         self.splitter_dragging = False
+        self.h_splitter_dragging = None
 
     def _update_splitter(self):
         """Update splitter position based on current mouse position."""
@@ -741,8 +939,59 @@ class DragoonPlotApp:
         self.bottom_panel_height = new_height
 
         # Update panel sizes
-        dpg.configure_item("graph_panel", height=-int(new_height + self._sz(12)))
+        dpg.configure_item("top_panel", height=-int(new_height + self._sz(12)))
         dpg.configure_item("bottom_panel", height=int(new_height))
+
+    def _update_h_splitters(self):
+        """Update horizontal section widths based on vertical splitter dragging."""
+        # Check which vertical splitter is hovered
+        self.h_splitter_hovered = None
+        for i in range(3):
+            tag = f"vsplitter_{i}"
+            if dpg.does_item_exist(tag) and dpg.is_item_hovered(tag):
+                self.h_splitter_hovered = i
+                break
+
+        # Handle dragging
+        if self.h_splitter_dragging is None:
+            return
+
+        idx = self.h_splitter_dragging
+        current_mouse_x = dpg.get_mouse_pos(local=False)[0]
+        delta_x = current_mouse_x - self.h_drag_start_mouse_x
+
+        min_width = self._sz(80)
+
+        # For splitter 2 (between Channels and Commands), only adjust Channels width
+        # Commands section always stays at width=-1 to fill remaining space
+        if idx == 2:
+            new_left = self.h_drag_start_widths[idx] + delta_x
+            if new_left < min_width:
+                new_left = min_width
+            self.section_widths[idx] = int(new_left)
+        else:
+            # For splitters 0 and 1, adjust both adjacent sections
+            new_left = self.h_drag_start_widths[idx] + delta_x
+            new_right = self.h_drag_start_widths[idx + 1] - delta_x
+
+            # Clamp to minimum widths
+            if new_left < min_width:
+                delta_x = min_width - self.h_drag_start_widths[idx]
+                new_left = min_width
+                new_right = self.h_drag_start_widths[idx + 1] - delta_x
+            if new_right < min_width:
+                delta_x = self.h_drag_start_widths[idx + 1] - min_width
+                new_right = min_width
+                new_left = self.h_drag_start_widths[idx] + delta_x
+
+            self.section_widths[idx] = int(new_left)
+            self.section_widths[idx + 1] = int(new_right)
+
+        # Update section widths (only first 3 sections - Commands section stays at width=-1)
+        section_tags = ["section_connection", "section_time", "section_channels"]
+        for i, tag in enumerate(section_tags):
+            if dpg.does_item_exist(tag):
+                dpg.configure_item(tag, width=self.section_widths[i])
 
     def _setup_gui(self):
         dpg.create_context()
@@ -770,48 +1019,71 @@ class DragoonPlotApp:
         self.drag_start_mouse_y = 0
         self.drag_start_panel_height = 0
 
+        # Horizontal section widths (resizable)
+        self.section_widths = [sz(220), sz(150), sz(350)]  # Connection, Time, Channels (Commands fills remaining)
+        self.h_splitter_dragging = None  # Which splitter is being dragged (0, 1, 2)
+        self.h_splitter_hovered = None
+        self.h_drag_start_mouse_x = 0
+        self.h_drag_start_widths = []
+
         # Register global mouse handlers for splitter dragging
         with dpg.handler_registry(tag="global_handlers"):
             dpg.add_mouse_click_handler(button=0, callback=self._on_mouse_down)
             dpg.add_mouse_release_handler(button=0, callback=self._on_mouse_release)
 
         with dpg.window(tag="main_window"):
-            # Top panel - Graph (takes most space)
-            with dpg.child_window(tag="graph_panel", height=sz(-182)):
-                with dpg.plot(
-                    label="Serial Data",
-                    tag="main_plot",
-                    height=-1,
-                    width=-1,
-                    anti_aliased=True,
-                ):
-                    dpg.add_plot_legend()
-                    dpg.add_plot_axis(dpg.mvXAxis, label="Seconds", tag="x_axis")
-                    dpg.add_plot_axis(dpg.mvYAxis, label="Value", tag="y_axis")
+            # Top panel - Tabbed view (Graph and Terminal)
+            with dpg.child_window(tag="top_panel", height=sz(-182)):
+                with dpg.tab_bar(tag="main_tabs"):
+                    # Graph tab
+                    with dpg.tab(label="Graph", tag="graph_tab"):
+                        with dpg.plot(
+                            label="Serial Data",
+                            tag="main_plot",
+                            height=-1,
+                            width=-1,
+                            anti_aliased=True,
+                        ):
+                            dpg.add_plot_legend()
+                            dpg.add_plot_axis(dpg.mvXAxis, label="Seconds", tag="x_axis")
+                            dpg.add_plot_axis(dpg.mvYAxis, label="Value", tag="y_axis", auto_fit=True)
+
+                    # Terminal tab
+                    with dpg.tab(label="Terminal", tag="terminal_tab"):
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label="Clear", callback=self._clear_terminal, width=sz(60))
+                            dpg.add_checkbox(label="Auto-scroll", tag="terminal_autoscroll", default_value=True)
+                        with dpg.child_window(tag="terminal_scroll_container", height=-1, width=-1):
+                            dpg.add_text(
+                                tag="terminal_output",
+                                default_value="",
+                                tracked=True,
+                                track_offset=1.0,  # Track at bottom
+                            )
 
             # Splitter bar - draggable divider
             dpg.add_button(tag="splitter_bar", label="", height=sz(10), width=-1)
             dpg.bind_item_theme("splitter_bar", self._create_splitter_theme())
 
-            # Bottom panel - Controls
+            # Bottom panel - Controls with resizable sections
             with dpg.child_window(tag="bottom_panel", height=sz(170)):
                 with dpg.group(horizontal=True):
                     # Connection section
-                    with dpg.group(width=sz(220)):
+                    with dpg.child_window(tag="section_connection", width=self.section_widths[0], height=-1, border=False):
                         dpg.add_text("Connection", color=(200, 200, 255))
                         with dpg.group(horizontal=True):
                             dpg.add_combo(
                                 tag="port_combo",
                                 items=[],
                                 default_value=self.config.last_port,
-                                width=sz(120),
+                                width=-25,
                             )
                             dpg.add_button(label="R", callback=self._refresh_ports, width=sz(25))
                         dpg.add_combo(
                             tag="baud_combo",
                             items=[str(b) for b in BAUD_RATES],
                             default_value=str(self.config.last_baud),
-                            width=sz(145),
+                            width=-1,
                         )
                         with dpg.group(horizontal=True):
                             dpg.add_button(
@@ -824,10 +1096,12 @@ class DragoonPlotApp:
                             dpg.add_button(label="Save", callback=self._save_config, width=sz(50))
                         dpg.add_text("Disconnected", tag="status_text", color=(255, 100, 100))
 
-                    dpg.add_separator()
+                    # Vertical splitter 0
+                    dpg.add_button(tag="vsplitter_0", label="", width=sz(6), height=-1)
+                    dpg.bind_item_theme("vsplitter_0", self._create_vsplitter_theme())
 
-                    # Graph settings
-                    with dpg.group(width=sz(150)):
+                    # Time/Graph settings section
+                    with dpg.child_window(tag="section_time", width=self.section_widths[1], height=-1, border=False):
                         dpg.add_text("X Axis Range", color=(200, 200, 255))
                         dpg.add_slider_float(
                             tag="time_slider",
@@ -835,33 +1109,37 @@ class DragoonPlotApp:
                             min_value=1.0,
                             max_value=300.0,
                             callback=lambda s, a: setattr(self, 'time_window', a),
-                            width=sz(140),
+                            width=-1,
                             format="%.0f sec",
                         )
                         dpg.add_input_float(
                             tag="time_input",
                             default_value=self.time_window,
-                            width=sz(140),
+                            width=-1,
                             callback=self._on_time_input,
                             format="%.1f",
                             step=1.0,
                         )
 
-                    dpg.add_separator()
+                    # Vertical splitter 1
+                    dpg.add_button(tag="vsplitter_1", label="", width=sz(6), height=-1)
+                    dpg.bind_item_theme("vsplitter_1", self._create_vsplitter_theme())
 
                     # Channels section
-                    with dpg.group(width=sz(350)):
+                    with dpg.child_window(tag="section_channels", width=self.section_widths[2], height=-1, border=False):
                         dpg.add_text("Channels (Vis|Color|Name|Scale|Offset)", color=(200, 200, 255))
-                        with dpg.child_window(tag="channels_window", height=-1, width=sz(340)):
+                        with dpg.child_window(tag="channels_window", height=-1, width=-1):
                             dpg.add_group(tag="channel_controls_group")
 
-                    dpg.add_separator()
+                    # Vertical splitter 2
+                    dpg.add_button(tag="vsplitter_2", label="", width=sz(6), height=-1)
+                    dpg.bind_item_theme("vsplitter_2", self._create_vsplitter_theme())
 
                     # Commands section
-                    with dpg.group():
+                    with dpg.child_window(tag="section_commands", width=-1, height=-1, border=False):
                         with dpg.group(horizontal=True):
                             dpg.add_text("Commands", color=(200, 200, 255))
-                            dpg.add_button(label="+", callback=self._add_command_button, width=sz(25))
+                            dpg.add_button(label="Discover", callback=self._discover_commands, width=sz(60))
                         with dpg.child_window(tag="cmd_window", height=-1, width=-1):
                             dpg.add_group(tag="cmd_buttons_group")
 
@@ -901,8 +1179,7 @@ class DragoonPlotApp:
             timestamps = [self.time_window - (current_time - t) for t in timestamps]
 
             # Apply scale and offset
-            if cfg.scale != 1.0 or cfg.offset != 0.0:
-                values = [v * cfg.scale + cfg.offset for v in values]
+            values = [v * cfg.scale + cfg.offset for v in values]
 
             # Check if series exists
             if dpg.does_item_exist(series_tag):
@@ -945,12 +1222,31 @@ class DragoonPlotApp:
             # Update splitter position if dragging
             self._update_splitter()
 
+            # Update horizontal section splitters
+            self._update_h_splitters()
+
             # Rebuild channel controls if new channels detected or labels updated
             current_count = len(self.channel_configs)
             if current_count != last_channel_count or self.labels_updated:
                 self._rebuild_channel_controls()
                 last_channel_count = current_count
                 self.labels_updated = False
+
+            # Rebuild command buttons if discovered new commands
+            if self.commands_updated:
+                self._rebuild_command_buttons()
+                self.commands_updated = False
+
+            # Check for help parsing timeout (finalize after 2 seconds of no new lines)
+            if self.help_parsing and self.parsed_commands:
+                if hasattr(self, 'help_last_line_time'):
+                    if time.time() - self.help_last_line_time > 2.0:
+                        self.help_parsing = False
+                        self.command_buttons = self.parsed_commands
+                        self.commands_updated = True
+
+            # Process terminal output queue (thread-safe GUI updates)
+            self._process_terminal_queue()
 
             dpg.render_dearpygui_frame()
 
