@@ -130,6 +130,22 @@ def get_display_scale() -> float:
     # macOS handles DPI scaling automatically
     return 1.0
 
+
+def get_dfu_util_path() -> str:
+    """Get path to dfu-util executable (bundled on Windows, system on Linux)."""
+    if sys.platform == 'win32':
+        if getattr(sys, 'frozen', False):
+            # Running as PyInstaller bundle on Windows
+            return os.path.join(sys._MEIPASS, 'dfu-util.exe')
+        else:
+            # Running as script on Windows - look in same directory
+            local_path = os.path.join(os.path.dirname(__file__), 'dfu-util.exe')
+            if os.path.exists(local_path):
+                return local_path
+    # Linux/Mac: use system dfu-util
+    return 'dfu-util'
+
+
 # === Constants ===
 START_DATA = 0xAA
 START_LABEL = 0xAB
@@ -183,6 +199,7 @@ class AppConfig:
     channels: list = field(default_factory=list)
     buttons: list = field(default_factory=list)
     time_window: float = DEFAULT_TIME_WINDOW
+    dfu_file_path: str = ""
 
     def to_dict(self):
         return {
@@ -198,6 +215,7 @@ class AppConfig:
                 for b in self.buttons
             ],
             "time_window": self.time_window,
+            "dfu_file_path": self.dfu_file_path,
         }
 
     @classmethod
@@ -225,6 +243,7 @@ class AppConfig:
             for b in d.get("buttons", [])
         ]
         cfg.time_window = d.get("time_window", DEFAULT_TIME_WINDOW)
+        cfg.dfu_file_path = d.get("dfu_file_path", "")
         return cfg
 
 
@@ -539,6 +558,7 @@ class DragoonPlotApp:
         self.commands_updated = False  # Flag to rebuild command buttons
         self.terminal_queue: list[str] = []  # Queue for terminal output (thread-safe)
         self.terminal_lock = threading.Lock()
+        self.dfu_output_queue: list[str] = []  # Queue for DFU output (thread-safe)
         self._setup_gui()
 
     def _load_config(self) -> AppConfig:
@@ -728,6 +748,116 @@ class DragoonPlotApp:
                 dpg.set_y_scroll("terminal_scroll_container", max_scroll)
             except Exception:
                 pass
+
+    def _browse_dfu_file(self):
+        """Open file dialog to select .bin file."""
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        file_path = filedialog.askopenfilename(
+            title="Select Firmware File",
+            filetypes=[("Binary Files", "*.bin"), ("All Files", "*.*")]
+        )
+        root.destroy()
+        if file_path:
+            dpg.set_value("dfu_file_path", file_path)
+            self.config.dfu_file_path = file_path
+
+    def _enter_dfu_mode(self):
+        """Send DFU command to device or show manual instructions."""
+        if self.serial_manager.is_connected():
+            self.serial_manager.send(b"dfu\r\n")
+            self._append_dfu_output("Sent 'dfu' command to device...")
+            self._append_dfu_output("Device should disconnect and enter DFU bootloader.")
+        else:
+            self._append_dfu_output("Not connected. Manual DFU entry:")
+            self._append_dfu_output("1. Hold BOOT0 button")
+            self._append_dfu_output("2. Press and release RESET")
+            self._append_dfu_output("3. Release BOOT0")
+            self._append_dfu_output("Device should appear as STM32 BOOTLOADER")
+
+    def _flash_dfu(self):
+        """Flash firmware using dfu-util in background thread."""
+        file_path = dpg.get_value("dfu_file_path")
+        address = dpg.get_value("dfu_address")
+
+        if not file_path or not Path(file_path).exists():
+            self._append_dfu_output("ERROR: Please select a valid .bin file")
+            return
+
+        dfu_util = get_dfu_util_path()
+        # On Windows, check if bundled exe exists; on Linux, just use system command
+        if sys.platform == 'win32' and not Path(dfu_util).exists():
+            self._append_dfu_output("ERROR: dfu-util.exe not found in application directory")
+            return
+
+        self._append_dfu_output(f"Flashing {Path(file_path).name}...")
+        self._append_dfu_output(f"Target: {address}")
+
+        def worker():
+            try:
+                cmd = [dfu_util, '-a', '0', '-s', address, '-D', file_path]
+                self._append_dfu_output(f"Running: {' '.join(cmd)}")
+
+                # Use Popen for real-time output streaming
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,  # Merge stderr into stdout
+                    text=True,
+                    bufsize=1,  # Line buffered
+                )
+
+                # Stream output line by line
+                for line in process.stdout:
+                    line = line.rstrip('\n\r')
+                    if line:
+                        self._append_dfu_output(line)
+
+                process.wait()
+
+                if process.returncode == 0:
+                    self._append_dfu_output("Flash completed successfully!")
+                    dpg.configure_item("dfu_status", default_value="Success", color=(100, 255, 100))
+                else:
+                    self._append_dfu_output(f"Flash failed (exit code {process.returncode})")
+                    dpg.configure_item("dfu_status", default_value="Failed", color=(255, 100, 100))
+            except FileNotFoundError:
+                if sys.platform == 'win32':
+                    self._append_dfu_output("ERROR: dfu-util.exe not found in application directory")
+                else:
+                    self._append_dfu_output("ERROR: dfu-util not found. Install: sudo apt install dfu-util")
+            except Exception as e:
+                self._append_dfu_output(f"ERROR: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _append_dfu_output(self, text: str):
+        """Thread-safe append to DFU output."""
+        with self.terminal_lock:
+            self.dfu_output_queue.append(text)
+
+    def _process_dfu_queue(self):
+        """Process DFU output queue (called from main loop)."""
+        if not dpg.does_item_exist("dfu_output"):
+            return
+        with self.terminal_lock:
+            if not self.dfu_output_queue:
+                return
+            lines = self.dfu_output_queue.copy()
+            self.dfu_output_queue.clear()
+        current = dpg.get_value("dfu_output")
+        new_text = current + "\n".join(lines) + "\n"
+        if len(new_text) > 50000:
+            new_text = new_text[-50000:]
+        dpg.set_value("dfu_output", new_text)
+        try:
+            max_scroll = dpg.get_y_scroll_max("dfu_output_container")
+            dpg.set_y_scroll("dfu_output_container", max_scroll)
+        except Exception:
+            pass
 
     def _on_time_input(self, sender, value):
         """Handle manual time window input."""
@@ -1061,6 +1191,31 @@ class DragoonPlotApp:
                                 track_offset=1.0,  # Track at bottom
                             )
 
+                    # DFU tab
+                    with dpg.tab(label="DFU", tag="dfu_tab"):
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(label="Browse", callback=self._browse_dfu_file, width=sz(60))
+                            dpg.add_input_text(
+                                tag="dfu_file_path",
+                                default_value=self.config.dfu_file_path,
+                                hint="Select .bin file...",
+                                width=-1,
+                                readonly=True
+                            )
+                        with dpg.group(horizontal=True):
+                            dpg.add_text("Address:")
+                            dpg.add_input_text(tag="dfu_address", default_value="0x08004000", width=sz(100))
+                            dpg.add_button(label="Enter DFU", callback=self._enter_dfu_mode, width=sz(80))
+                            dpg.add_button(label="Flash", callback=self._flash_dfu, width=sz(60))
+                        dpg.add_text("", tag="dfu_status", color=(200, 200, 200))
+                        with dpg.child_window(tag="dfu_output_container", height=-1, width=-1):
+                            dpg.add_text(
+                                tag="dfu_output",
+                                default_value="",
+                                tracked=True,
+                                track_offset=1.0,
+                            )
+
             # Splitter bar - draggable divider
             dpg.add_button(tag="splitter_bar", label="", height=sz(10), width=-1)
             dpg.bind_item_theme("splitter_bar", self._create_splitter_theme())
@@ -1247,6 +1402,7 @@ class DragoonPlotApp:
 
             # Process terminal output queue (thread-safe GUI updates)
             self._process_terminal_queue()
+            self._process_dfu_queue()
 
             dpg.render_dearpygui_frame()
 
