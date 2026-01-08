@@ -376,3 +376,112 @@ Example: 8 channels at 115200 baud
 - Confirm little-endian int16 encoding
 - Check scale/offset settings in the UI
 - Verify sensor readings on the MCU side
+
+---
+
+## Text Protocol (Commands)
+
+DragoonPlot can discover and display command buttons by parsing help output from the device. This allows devices to expose their available commands without hardcoding them in the application.
+
+### Command Discovery
+
+When the user clicks "Discover" in the Commands section, DragoonPlot sends:
+
+```
+help\r\n
+```
+
+The device should respond with a formatted table that DragoonPlot parses to create command buttons.
+
+### Help Output Format
+
+```
+GMU Commands
+---------+----------+-------+---------------------------
+CMD      | ARGS     | CAT   | DESCRIPTION
+---------+----------+-------+---------------------------
+start    | -        | state | Start the motor
+stop     | -        | state | Stop the motor
+status   | -        | diag  | Show system status
+setpid   | kp ki kd | param | Set PID parameters
+help     | -        | sys   | Show this help
+---------+----------+-------+---------------------------
+```
+
+### Parsing Rules
+
+1. **Start marker:** Line containing "GMU Commands" begins parsing
+2. **Table format:** Columns separated by `|` character
+3. **Command extraction:**
+   - `CMD`: Command name (becomes button label, capitalized)
+   - `ARGS`: If `-`, command takes no arguments and gets a button
+   - `CAT`: Category for grouping buttons
+   - `DESCRIPTION`: Ignored by parser (for human reference)
+4. **End markers:**
+   - Closing separator line starting with `---------+`
+   - Or line containing `help` command in `sys` category
+   - Or 2-second timeout after last line received
+
+### Categories
+
+Commands are grouped in the UI by category:
+
+| Category | Display Name | Description |
+|----------|--------------|-------------|
+| `state`  | State        | State control commands (start, stop, etc.) |
+| `diag`   | Diagnostics  | Diagnostic and status commands |
+| `param`  | Parameters   | Parameter configuration commands |
+| `sys`    | System       | System commands (help, reset, dfu, etc.) |
+
+### Button Behavior
+
+- Only commands with `ARGS == "-"` (no arguments) get buttons
+- Clicking a button sends: `<command>\r\n`
+- Commands requiring arguments must be sent manually via the Terminal tab
+
+### STM32/C Implementation
+
+```c
+void cmd_help(void) {
+    printf("\r\nGMU Commands\r\n");
+    printf("---------+----------+-------+---------------------------\r\n");
+    printf("CMD      | ARGS     | CAT   | DESCRIPTION\r\n");
+    printf("---------+----------+-------+---------------------------\r\n");
+    printf("start    | -        | state | Start the motor\r\n");
+    printf("stop     | -        | state | Stop the motor\r\n");
+    printf("status   | -        | diag  | Show system status\r\n");
+    printf("setpid   | kp ki kd | param | Set PID parameters\r\n");
+    printf("dfu      | -        | sys   | Enter DFU bootloader\r\n");
+    printf("help     | -        | sys   | Show this help\r\n");
+    printf("---------+----------+-------+---------------------------\r\n");
+}
+```
+
+### Arduino Implementation
+
+```c
+void printHelp() {
+    Serial.println("\r\nGMU Commands");
+    Serial.println("---------+----------+-------+---------------------------");
+    Serial.println("CMD      | ARGS     | CAT   | DESCRIPTION");
+    Serial.println("---------+----------+-------+---------------------------");
+    Serial.println("start    | -        | state | Start data streaming");
+    Serial.println("stop     | -        | state | Stop data streaming");
+    Serial.println("status   | -        | diag  | Show device status");
+    Serial.println("help     | -        | sys   | Show this help");
+    Serial.println("---------+----------+-------+---------------------------");
+}
+```
+
+### Troubleshooting Commands
+
+#### Buttons not appearing after Discover
+- Verify the help output contains "GMU Commands" header
+- Check that columns are separated by `|` character
+- Ensure `ARGS` column contains exactly `-` for no-argument commands
+- Check Terminal tab to see raw help output
+
+#### Wrong buttons appearing
+- Only commands with `ARGS == "-"` get buttons
+- Commands with arguments (e.g., `setpid | kp ki kd`) are intentionally excluded
+- Clear saved config (`~/.dragoonplot.json`) to reset buttons

@@ -9,6 +9,14 @@ Binary Protocol (no checksum):
     Label Frame:  [0xAB] [channel_count] [labels...]
                   Labels: [channel_idx] [len] [string bytes...]
 
+Text Protocol (commands):
+    Discover:     Sends "help\r\n" and parses tabular response
+    Format:       CMD | ARGS | CAT | DESCRIPTION
+    Buttons:      Created for commands with ARGS == "-"
+    Categories:   state, diag, param, sys
+
+See PROTOCOL.md for full protocol documentation.
+
 Dependencies:
     pip install dearpygui pyserial
 """
