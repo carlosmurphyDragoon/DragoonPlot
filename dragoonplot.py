@@ -1402,10 +1402,9 @@ class DragoonPlotApp:
             if dpg.does_item_exist(series_tag):
                 if cfg.visible and timestamps:
                     dpg.set_value(series_tag, [timestamps, values])
-                    # Only update label, don't force show=True (legend clicks toggle visibility)
-                    dpg.configure_item(series_tag, label=cfg.name or f"Ch{i}")
+                    dpg.configure_item(series_tag, label=cfg.name or f"Ch{i}", show=True)
                 else:
-                    # Checkbox unchecked - force hide
+                    # Checkbox unchecked or no data - hide
                     dpg.configure_item(series_tag, show=False)
             else:
                 if timestamps and cfg.visible:
