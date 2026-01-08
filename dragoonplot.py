@@ -728,6 +728,12 @@ class DragoonPlotApp:
         """Clear the terminal output."""
         if dpg.does_item_exist("terminal_output"):
             dpg.set_value("terminal_output", "")
+        # Reset scroll position to top
+        if dpg.does_item_exist("terminal_scroll_container"):
+            try:
+                dpg.set_y_scroll("terminal_scroll_container", 0)
+            except Exception:
+                pass
 
     def _process_terminal_queue(self):
         """Process queued terminal output (must be called from main thread)."""
@@ -748,7 +754,11 @@ class DragoonPlotApp:
         # Limit terminal buffer to ~50KB to prevent memory issues
         max_len = 50000
         if len(new_text) > max_len:
+            # Truncate from beginning, but find the first newline to avoid breaking mid-line
             new_text = new_text[-max_len:]
+            first_newline = new_text.find('\n')
+            if first_newline > 0:
+                new_text = new_text[first_newline + 1:]
         dpg.set_value("terminal_output", new_text)
 
         # Auto-scroll to bottom if enabled
@@ -1210,12 +1220,13 @@ class DragoonPlotApp:
                         with dpg.group(horizontal=True):
                             dpg.add_button(label="Clear", callback=self._clear_terminal, width=sz(60))
                             dpg.add_checkbox(label="Auto-scroll", tag="terminal_autoscroll", default_value=True)
-                        with dpg.child_window(tag="terminal_scroll_container", height=-1, width=-1):
+                        with dpg.child_window(tag="terminal_scroll_container", height=-1, width=-1, horizontal_scrollbar=False):
                             dpg.add_text(
                                 tag="terminal_output",
                                 default_value="",
                                 tracked=True,
                                 track_offset=1.0,  # Track at bottom
+                                wrap=-1,  # Wrap to parent container width
                             )
 
                     # DFU tab
