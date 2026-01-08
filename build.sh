@@ -18,7 +18,7 @@ rm -rf build/ dist/ __pycache__/
 
 # Build
 echo "Building executable..."
-pyinstaller serial_monitor.spec
+pyinstaller DragoonPlot.spec
 
 # Check result
 if [ -f "dist/DragoonPlot" ]; then
