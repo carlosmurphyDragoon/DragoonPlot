@@ -953,6 +953,10 @@ class DragoonPlotApp:
         idx = user_data
         if 0 <= idx < len(self.channel_configs):
             self.channel_configs[idx].visible = value
+            # Immediately hide/show the series so Y-axis rescales on next frame
+            series_tag = f"series_{idx}"
+            if dpg.does_item_exist(series_tag):
+                dpg.configure_item(series_tag, show=value)
 
     def _on_channel_color(self, sender, value, user_data):
         idx = user_data
@@ -1197,7 +1201,7 @@ class DragoonPlotApp:
                             width=-1,
                             anti_aliased=True,
                         ):
-                            dpg.add_plot_legend()
+                            dpg.add_plot_legend(no_buttons=True)
                             dpg.add_plot_axis(dpg.mvXAxis, label="Seconds", tag="x_axis")
                             dpg.add_plot_axis(dpg.mvYAxis, label="Value", tag="y_axis", auto_fit=True)
 
@@ -1339,6 +1343,11 @@ class DragoonPlotApp:
         # Data is shifted so newest point is at time_window
         dpg.set_axis_limits("x_axis", 0, self.time_window)
 
+        # Track min/max for Y axis auto-scaling
+        y_min = float('inf')
+        y_max = float('-inf')
+        has_visible_data = False
+
         # Update each channel
         num_channels = max(len(self.channel_configs), self.data_buffer.get_channel_count())
 
@@ -1359,12 +1368,25 @@ class DragoonPlotApp:
             # Apply scale and offset
             values = [v * cfg.scale + cfg.offset for v in values]
 
+            # Filter to only visible data (within time window)
+            visible_values = [v for t, v in zip(timestamps, values) if 0 <= t <= self.time_window]
+
+            # Update Y axis bounds from visible data (based on checkbox visibility)
+            if cfg.visible and visible_values:
+                ch_min = min(visible_values)
+                ch_max = max(visible_values)
+                y_min = min(y_min, ch_min)
+                y_max = max(y_max, ch_max)
+                has_visible_data = True
+
             # Check if series exists
             if dpg.does_item_exist(series_tag):
                 if cfg.visible and timestamps:
                     dpg.set_value(series_tag, [timestamps, values])
-                    dpg.configure_item(series_tag, show=True, label=cfg.name or f"Ch{i}")
+                    # Only update label, don't force show=True (legend clicks toggle visibility)
+                    dpg.configure_item(series_tag, label=cfg.name or f"Ch{i}")
                 else:
+                    # Checkbox unchecked - force hide
                     dpg.configure_item(series_tag, show=False)
             else:
                 if timestamps and cfg.visible:
@@ -1376,6 +1398,14 @@ class DragoonPlotApp:
                         parent="y_axis",
                     )
                     dpg.bind_item_theme(series_tag, self._create_line_theme(cfg.color))
+
+        # Apply Y axis auto-scaling with padding
+        if has_visible_data and y_min != float('inf'):
+            y_range = y_max - y_min
+            if y_range == 0:
+                y_range = abs(y_max) * 0.1 if y_max != 0 else 1.0
+            padding = y_range * 0.10  # 10% padding
+            dpg.set_axis_limits("y_axis", y_min - padding, y_max + padding)
 
     def _create_line_theme(self, color: tuple) -> str:
         """Create a theme for line color."""
