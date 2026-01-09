@@ -703,7 +703,7 @@ class DragoonPlotApp:
             self.terminal_queue.append(line)
 
         # Check for help output start
-        if "GMU Commands" in line:
+        if "Commands ===" in line:
             self.help_parsing = True
             self.parsed_commands = []
             self.help_parse_start_time = time.time()
@@ -731,12 +731,10 @@ class DragoonPlotApp:
                 return
 
             parts = [p.strip() for p in line.split("|")]
-            print(f"DEBUG: parts={parts}, len={len(parts)}")
             if len(parts) >= 3:
                 cmd = parts[0].strip()
                 args = parts[1].strip()
                 cat = parts[2].strip()
-                print(f"DEBUG: cmd={cmd}, args={args}, cat={cat}")
 
                 # Only add commands without arguments (ARGS == "-")
                 if cmd and args == "-":
@@ -747,13 +745,14 @@ class DragoonPlotApp:
                         category=cat
                     )
                     self.parsed_commands.append(btn)
-                    print(f"DEBUG: Added command {cmd}")
 
     def _discover_commands(self):
         """Send help command to discover available commands."""
         if self.serial_manager.is_connected():
             self.help_parsing = False
             self.parsed_commands = []
+            self.command_buttons = []
+            self._rebuild_command_buttons()
             self.serial_manager.send(b"help\r\n")
 
     def _get_selected_port(self) -> str:
