@@ -619,6 +619,10 @@ class DragoonPlotApp:
         self.terminal_queue: list[str] = []  # Queue for terminal output (thread-safe)
         self.terminal_lock = threading.Lock()
         self.dfu_output_queue: list[str] = []  # Queue for DFU output (thread-safe)
+        self.plot_paused = False  # When True, discard incoming data and freeze plot
+        self.logging = False  # When True, log data to CSV file
+        self.log_file = None  # File handle for CSV logging
+        self.log_start_time = 0  # Time when logging started
         self._setup_gui()
 
     def _load_config(self) -> AppConfig:
@@ -773,7 +777,7 @@ class DragoonPlotApp:
     def _toggle_connection(self):
         if self.serial_manager.is_connected():
             self.serial_manager.disconnect()
-            dpg.set_value("connect_btn", "Connect")
+            dpg.configure_item("connect_btn", label="Connect")
             dpg.configure_item("status_text", default_value="Disconnected", color=(255, 100, 100))
         else:
             port = self._get_selected_port()
@@ -790,6 +794,64 @@ class DragoonPlotApp:
         self.data_buffer.clear()
         # Sync serial manager timestamp with data buffer
         self.serial_manager.batch_time = self.data_buffer.start_time
+
+    def _toggle_pause(self):
+        """Toggle plot pause state. When paused, incoming data is discarded."""
+        self.plot_paused = not self.plot_paused
+        if self.plot_paused:
+            dpg.configure_item("pause_btn", label="Resume")
+        else:
+            dpg.configure_item("pause_btn", label="Pause")
+
+    def _get_next_log_filename(self) -> str:
+        """Get the next available log filename (dragoonplot_data0.csv, dragoonplot_data1.csv, etc.)."""
+        i = 0
+        while True:
+            filename = f"dragoonplot_data{i}.csv"
+            if not os.path.exists(filename):
+                return filename
+            i += 1
+
+    def _toggle_logging(self):
+        """Toggle CSV data logging on/off."""
+        if self.logging:
+            # Stop logging
+            self.logging = False
+            if self.log_file:
+                self.log_file.close()
+                self.log_file = None
+            dpg.configure_item("log_btn", label="Log")
+        else:
+            # Start logging
+            filename = self._get_next_log_filename()
+            try:
+                self.log_file = open(filename, 'w', newline='')
+                self.log_start_time = time.time()
+                self.logging = True
+                self._log_header_written = False
+                dpg.configure_item("log_btn", label="Stop Log")
+                print(f"Logging to {filename}")
+            except Exception as e:
+                print(f"Error opening log file: {e}")
+
+    def _log_data(self, values: list):
+        """Write a data sample to the CSV log file."""
+        if not self.logging or not self.log_file:
+            return
+        # Write header on first data
+        if not self._log_header_written:
+            headers = ["timestamp"]
+            for i in range(len(values)):
+                if i < len(self.channel_configs) and self.channel_configs[i].name:
+                    headers.append(self.channel_configs[i].name)
+                else:
+                    headers.append(f"Ch{i}")
+            self.log_file.write(",".join(headers) + "\n")
+            self._log_header_written = True
+        # Write data row
+        timestamp = time.time() - self.log_start_time
+        row = [f"{timestamp:.6f}"] + [str(v) for v in values]
+        self.log_file.write(",".join(row) + "\n")
 
     def _clear_terminal(self):
         """Clear the terminal output."""
@@ -1038,7 +1100,13 @@ class DragoonPlotApp:
     def _on_channel_color(self, sender, value, user_data):
         idx = user_data
         if 0 <= idx < len(self.channel_configs):
-            self.channel_configs[idx].color = (int(value[0]), int(value[1]), int(value[2]))
+            # DearPyGui color_edit returns values as normalized floats 0.0-1.0
+            new_color = (int(value[0] * 255), int(value[1] * 255), int(value[2] * 255))
+            self.channel_configs[idx].color = new_color
+            # Apply new theme to the series immediately
+            series_tag = f"series_{idx}"
+            if dpg.does_item_exist(series_tag):
+                dpg.bind_item_theme(series_tag, self._create_line_theme(new_color))
 
     def _on_channel_name(self, sender, value, user_data):
         idx = user_data
@@ -1182,7 +1250,10 @@ class DragoonPlotApp:
         current_mouse_x = dpg.get_mouse_pos(local=False)[0]
         delta_x = current_mouse_x - self.h_drag_start_mouse_x
 
-        min_width = self._sz(80)
+        # Minimum widths per section: Connection needs more space for buttons
+        min_widths = [self._sz(180), self._sz(80), self._sz(80)]
+        min_width = min_widths[idx] if idx < len(min_widths) else self._sz(80)
+        min_width_right = min_widths[idx + 1] if idx + 1 < len(min_widths) else self._sz(80)
 
         # For splitter 2 (between Channels and Commands), only adjust Channels width
         # Commands section always stays at width=-1 to fill remaining space
@@ -1201,9 +1272,9 @@ class DragoonPlotApp:
                 delta_x = min_width - self.h_drag_start_widths[idx]
                 new_left = min_width
                 new_right = self.h_drag_start_widths[idx + 1] - delta_x
-            if new_right < min_width:
-                delta_x = self.h_drag_start_widths[idx + 1] - min_width
-                new_right = min_width
+            if new_right < min_width_right:
+                delta_x = self.h_drag_start_widths[idx + 1] - min_width_right
+                new_right = min_width_right
                 new_left = self.h_drag_start_widths[idx] + delta_x
 
             self.section_widths[idx] = int(new_left)
@@ -1331,29 +1402,34 @@ class DragoonPlotApp:
                     # Connection section
                     with dpg.child_window(tag="section_connection", width=self.section_widths[0], height=-1, border=False):
                         dpg.add_text("Connection", color=(200, 200, 255))
-                        with dpg.group(horizontal=True):
-                            dpg.add_combo(
-                                tag="port_combo",
-                                items=[],
-                                default_value=self.config.last_port,
-                                width=-25,
-                            )
-                            dpg.add_button(label="R", callback=self._refresh_ports, width=sz(25))
+                        dpg.add_combo(
+                            tag="port_combo",
+                            items=[],
+                            default_value=self.config.last_port,
+                            width=-1,
+                        )
+                        dpg.add_button(label="Refresh", callback=self._refresh_ports, width=-1)
                         dpg.add_combo(
                             tag="baud_combo",
                             items=[str(b) for b in BAUD_RATES],
                             default_value=str(self.config.last_baud),
                             width=-1,
                         )
-                        with dpg.group(horizontal=True):
-                            dpg.add_button(
-                                label="Connect",
-                                tag="connect_btn",
-                                callback=self._toggle_connection,
-                                width=sz(70),
-                            )
-                            dpg.add_button(label="Clear", callback=self._clear_data, width=sz(50))
-                            dpg.add_button(label="Save", callback=self._save_config, width=sz(50))
+                        with dpg.table(header_row=False, borders_innerV=False, borders_outerV=False,
+                                       borders_innerH=False, borders_outerH=False):
+                            dpg.add_table_column(width_stretch=True)
+                            dpg.add_table_column(width_stretch=True)
+                            with dpg.table_row():
+                                dpg.add_button(
+                                    label="Connect",
+                                    tag="connect_btn",
+                                    callback=self._toggle_connection,
+                                    width=-1,
+                                )
+                                dpg.add_button(label="Clear", callback=self._clear_data, width=-1)
+                            with dpg.table_row():
+                                dpg.add_button(label="Pause", tag="pause_btn", callback=self._toggle_pause, width=-1)
+                                dpg.add_button(label="Log", tag="log_btn", callback=self._toggle_logging, width=-1)
                         dpg.add_text("Disconnected", tag="status_text", color=(255, 100, 100))
 
                     # Vertical splitter 0
@@ -1504,6 +1580,8 @@ class DragoonPlotApp:
                 if cfg.visible and len(plot_t) > 0:
                     dpg.set_value(series_tag, [plot_t.tolist(), plot_v.tolist()])
                     dpg.configure_item(series_tag, label=cfg.name or f"Ch{i}", show=True)
+                    # Update theme in case color changed
+                    dpg.bind_item_theme(series_tag, self._create_line_theme(cfg.color))
                 else:
                     dpg.configure_item(series_tag, show=False)
             else:
@@ -1581,6 +1659,10 @@ class DragoonPlotApp:
             dpg.render_dearpygui_frame()
 
         self.serial_manager.disconnect()
+        # Close log file if still open
+        if self.log_file:
+            self.log_file.close()
+            self.log_file = None
         self._save_config()
         dpg.destroy_context()
 
