@@ -659,6 +659,10 @@ class DragoonPlotApp:
         if not batch:
             return
 
+        # When paused, discard incoming data
+        if self.plot_paused:
+            return
+
         if not hasattr(self, '_data_frame_count'):
             self._data_frame_count = 0
 
@@ -798,8 +802,14 @@ class DragoonPlotApp:
         """Toggle plot pause state. When paused, incoming data is discarded."""
         self.plot_paused = not self.plot_paused
         if self.plot_paused:
+            # Freeze the current time so traces don't move
+            self.paused_time = time.time() - self.data_buffer.start_time
             dpg.configure_item("pause_btn", label="Resume")
         else:
+            # Adjust start_time so old data stays in place and new data continues from here
+            pause_duration = (time.time() - self.data_buffer.start_time) - self.paused_time
+            self.data_buffer.start_time += pause_duration
+            self.serial_manager.batch_time = self.data_buffer.start_time
             dpg.configure_item("pause_btn", label="Pause")
 
     def _get_next_log_filename(self) -> str:
@@ -1536,7 +1546,11 @@ class DragoonPlotApp:
 
         # Update each channel
         num_channels = max(len(self.channel_configs), self.data_buffer.get_channel_count())
-        current_time = time.time() - self.data_buffer.start_time
+        # Use frozen time when paused, otherwise current time
+        if self.plot_paused and hasattr(self, 'paused_time'):
+            current_time = self.paused_time
+        else:
+            current_time = time.time() - self.data_buffer.start_time
 
         for i in range(num_channels):
             series_tag = f"series_{i}"
