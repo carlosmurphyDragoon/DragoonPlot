@@ -29,9 +29,10 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from collections import deque
 from typing import Optional, Union
 from dataclasses import dataclass, field
+
+import numpy as np
 
 import dearpygui.dearpygui as dpg
 import serial
@@ -390,17 +391,20 @@ class BinaryProtocolParser:
 
 
 class SerialManager:
-    """Threaded serial port manager."""
+    """Threaded serial port manager with batch accumulation."""
 
-    def __init__(self, on_data_callback, on_labels_callback=None, on_text_callback=None):
+    def __init__(self, on_labels_callback=None, on_text_callback=None):
         self.port: Optional[serial.Serial] = None
         self.thread: Optional[threading.Thread] = None
         self.running = False
-        self.on_data = on_data_callback
         self.on_text = on_text_callback
         self.parser = BinaryProtocolParser(on_labels_callback)
         self.lock = threading.Lock()
         self.text_buffer = bytearray()
+        # Batch accumulation for data frames
+        self.frame_batch: list = []
+        self.batch_lock = threading.Lock()
+        self.batch_time = time.time()  # Track time for batch timestamps
 
     @staticmethod
     def list_ports() -> list:
@@ -459,6 +463,13 @@ class SerialManager:
             except Exception as e:
                 print(f"Send error: {e}")
 
+    def get_batch(self) -> list:
+        """Get accumulated data frames and clear the batch. Returns list of (timestamp, values) tuples."""
+        with self.batch_lock:
+            batch = self.frame_batch
+            self.frame_batch = []
+            return batch
+
     def _read_loop(self):
         """Background thread for reading serial data."""
         bytes_received = 0
@@ -482,6 +493,7 @@ class SerialManager:
                         continue
 
                 bytes_received += len(data)
+                current_time = time.time() - self.batch_time
 
                 for byte_val in data:
                     # Always try to collect printable ASCII as text first
@@ -508,7 +520,10 @@ class SerialManager:
                     result = self.parser.feed(byte_val)
                     if result is not None:
                         frames_parsed += 1
-                        self.on_data(result)
+                        # Accumulate frame with timestamp into batch
+                        with self.batch_lock:
+                            self.frame_batch.append((current_time, result))
+
                 # Report stats every 2 seconds
                 now = time.time()
                 if now - last_report >= 2.0:
@@ -524,38 +539,64 @@ class SerialManager:
 
 
 class DataBuffer:
-    """Circular buffer for channel data with timestamps."""
+    """High-performance circular buffer using numpy arrays."""
 
     def __init__(self, max_size: int = BUFFER_SIZE):
         self.max_size = max_size
-        self.channels: dict[int, deque] = {}
-        self.timestamps: dict[int, deque] = {}
+        self.timestamps: dict[int, np.ndarray] = {}
+        self.values: dict[int, np.ndarray] = {}
+        self.write_idx: dict[int, int] = {}
+        self.count: dict[int, int] = {}
         self.start_time = time.time()
         self.lock = threading.Lock()
 
-    def add_sample(self, channel: int, value: float):
+    def _ensure_channel(self, channel: int):
+        """Allocate arrays for a new channel (call under lock)."""
+        if channel not in self.timestamps:
+            self.timestamps[channel] = np.zeros(self.max_size, dtype=np.float64)
+            self.values[channel] = np.zeros(self.max_size, dtype=np.float64)
+            self.write_idx[channel] = 0
+            self.count[channel] = 0
+
+    def add_batch(self, samples: list):
+        """Add multiple samples: [(channel, timestamp, value), ...]"""
         with self.lock:
-            if channel not in self.channels:
-                self.channels[channel] = deque(maxlen=self.max_size)
-                self.timestamps[channel] = deque(maxlen=self.max_size)
-            t = time.time() - self.start_time
-            self.channels[channel].append(value)
-            self.timestamps[channel].append(t)
+            for ch, ts, val in samples:
+                self._ensure_channel(ch)
+                idx = self.write_idx[ch]
+                self.timestamps[ch][idx] = ts
+                self.values[ch][idx] = val
+                self.write_idx[ch] = (idx + 1) % self.max_size
+                self.count[ch] = min(self.count[ch] + 1, self.max_size)
 
     def get_data(self, channel: int) -> tuple:
+        """Return (timestamps, values) as numpy arrays, properly ordered."""
         with self.lock:
-            if channel not in self.channels:
-                return [], []
-            return list(self.timestamps[channel]), list(self.channels[channel])
+            if channel not in self.timestamps:
+                return np.array([]), np.array([])
+            count = self.count[channel]
+            if count == 0:
+                return np.array([]), np.array([])
+            if count < self.max_size:
+                # Buffer not full yet - simple slice
+                return self.timestamps[channel][:count].copy(), self.values[channel][:count].copy()
+            else:
+                # Full buffer - reorder from write index (oldest data first)
+                idx = self.write_idx[channel]
+                ts = np.concatenate([self.timestamps[channel][idx:], self.timestamps[channel][:idx]])
+                vals = np.concatenate([self.values[channel][idx:], self.values[channel][:idx]])
+                return ts, vals
 
     def get_channel_count(self) -> int:
         with self.lock:
-            return len(self.channels)
+            return len(self.timestamps)
 
     def clear(self):
         with self.lock:
-            self.channels.clear()
             self.timestamps.clear()
+            self.values.clear()
+            self.write_idx.clear()
+            self.count.clear()
             self.start_time = time.time()
 
 
@@ -565,7 +606,7 @@ class DragoonPlotApp:
     def __init__(self):
         self.config = self._load_config()
         self.data_buffer = DataBuffer()
-        self.serial_manager = SerialManager(self._on_serial_data, self._on_labels, self._on_text_line)
+        self.serial_manager = SerialManager(self._on_labels, self._on_text_line)
         self.channel_configs: list[ChannelConfig] = list(self.config.channels)
         self.command_buttons: list[CommandButton] = list(self.config.buttons)
         self.time_window = self.config.time_window
@@ -612,28 +653,41 @@ class DragoonPlotApp:
         except Exception as e:
             print(f"Error saving config: {e}")
 
-    def _on_serial_data(self, values: list):
-        """Callback for incoming serial data."""
-        # Log data even when paused (logging is independent of plotting)
-        self._log_data(values)
-        # When paused, discard all incoming data from plot buffer
+    def _process_serial_batch(self):
+        """Process accumulated serial data frames from the batch queue."""
+        batch = self.serial_manager.get_batch()
+        if not batch:
+            return
+
+        # When paused, discard incoming data
         if self.plot_paused:
             return
+
         if not hasattr(self, '_data_frame_count'):
             self._data_frame_count = 0
-        self._data_frame_count += 1
-        if self._data_frame_count == 1:
-            print(f"First data frame: {len(values)} channels, values[0:5]={values[0:5]}")
-        for i, val in enumerate(values):
-            self.data_buffer.add_sample(i, val)
-            if i >= len(self.channel_configs):
-                color = DEFAULT_COLORS[i % len(DEFAULT_COLORS)]
-                name = self.pending_labels.get(i, f"Ch{i}")
-                self.channel_configs.append(ChannelConfig(
-                    name=name,
-                    color=color,
-                    visible=True,
-                ))
+
+        # Convert batch to samples: [(channel, timestamp, value), ...]
+        samples = []
+        for timestamp, values in batch:
+            self._data_frame_count += 1
+            if self._data_frame_count == 1:
+                print(f"First data frame: {len(values)} channels, values[0:5]={values[0:5]}")
+
+            for i, val in enumerate(values):
+                samples.append((i, timestamp, val))
+                # Ensure channel config exists
+                if i >= len(self.channel_configs):
+                    color = DEFAULT_COLORS[i % len(DEFAULT_COLORS)]
+                    name = self.pending_labels.get(i, f"Ch{i}")
+                    self.channel_configs.append(ChannelConfig(
+                        name=name,
+                        color=color,
+                        visible=True,
+                    ))
+
+        # Add all samples to buffer in one batch (single lock acquisition)
+        if samples:
+            self.data_buffer.add_batch(samples)
 
     def _on_labels(self, labels: dict):
         """Callback for incoming channel labels from MCU."""
@@ -653,7 +707,7 @@ class DragoonPlotApp:
             self.terminal_queue.append(line)
 
         # Check for help output start
-        if "GMU Commands" in line:
+        if "Commands ===" in line:
             self.help_parsing = True
             self.parsed_commands = []
             self.help_parse_start_time = time.time()
@@ -681,12 +735,10 @@ class DragoonPlotApp:
                 return
 
             parts = [p.strip() for p in line.split("|")]
-            print(f"DEBUG: parts={parts}, len={len(parts)}")
             if len(parts) >= 3:
                 cmd = parts[0].strip()
                 args = parts[1].strip()
                 cat = parts[2].strip()
-                print(f"DEBUG: cmd={cmd}, args={args}, cat={cat}")
 
                 # Only add commands without arguments (ARGS == "-")
                 if cmd and args == "-":
@@ -697,13 +749,14 @@ class DragoonPlotApp:
                         category=cat
                     )
                     self.parsed_commands.append(btn)
-                    print(f"DEBUG: Added command {cmd}")
 
     def _discover_commands(self):
         """Send help command to discover available commands."""
         if self.serial_manager.is_connected():
             self.help_parsing = False
             self.parsed_commands = []
+            self.command_buttons = []
+            self._rebuild_command_buttons()
             self.serial_manager.send(b"help\r\n")
 
     def _get_selected_port(self) -> str:
@@ -733,20 +786,30 @@ class DragoonPlotApp:
             port = self._get_selected_port()
             baud = self._get_selected_baud()
             if port and self.serial_manager.connect(port, baud):
-                dpg.configure_item("connect_btn", label="Disconnect")
+                # Sync timestamps between serial manager and data buffer
+                self.serial_manager.batch_time = self.data_buffer.start_time
+                dpg.set_value("connect_btn", "Disconnect")
                 dpg.configure_item("status_text", default_value=f"Connected: {port}", color=(100, 255, 100))
             else:
                 dpg.configure_item("status_text", default_value="Connection failed", color=(255, 100, 100))
 
     def _clear_data(self):
         self.data_buffer.clear()
+        # Sync serial manager timestamp with data buffer
+        self.serial_manager.batch_time = self.data_buffer.start_time
 
     def _toggle_pause(self):
         """Toggle plot pause state. When paused, incoming data is discarded."""
         self.plot_paused = not self.plot_paused
         if self.plot_paused:
+            # Freeze the current time so traces don't move
+            self.paused_time = time.time() - self.data_buffer.start_time
             dpg.configure_item("pause_btn", label="Resume")
         else:
+            # Adjust start_time so old data stays in place and new data continues from here
+            pause_duration = (time.time() - self.data_buffer.start_time) - self.paused_time
+            self.data_buffer.start_time += pause_duration
+            self.serial_manager.batch_time = self.data_buffer.start_time
             dpg.configure_item("pause_btn", label="Pause")
 
     def _get_next_log_filename(self) -> str:
@@ -1437,13 +1500,43 @@ class DragoonPlotApp:
         if self.config.last_port in ports:
             dpg.set_value("port_combo", self.config.last_port)
 
+    def _downsample_minmax(self, timestamps: np.ndarray, values: np.ndarray, max_points: int = 2000) -> tuple:
+        """Downsample data while preserving min/max peaks in each bin."""
+        n = len(timestamps)
+        if n <= max_points:
+            return timestamps, values
+
+        # Calculate bin size to get approximately max_points/2 bins (each yields 2 points: min and max)
+        bin_size = n // (max_points // 2)
+        if bin_size < 2:
+            return timestamps, values
+
+        result_t = []
+        result_v = []
+
+        for i in range(0, n - bin_size + 1, bin_size):
+            chunk_t = timestamps[i:i + bin_size]
+            chunk_v = values[i:i + bin_size]
+            min_idx = np.argmin(chunk_v)
+            max_idx = np.argmax(chunk_v)
+            # Add in time order to preserve waveform shape
+            if min_idx <= max_idx:
+                result_t.append(chunk_t[min_idx])
+                result_v.append(chunk_v[min_idx])
+                if min_idx != max_idx:  # Avoid duplicates
+                    result_t.append(chunk_t[max_idx])
+                    result_v.append(chunk_v[max_idx])
+            else:
+                result_t.append(chunk_t[max_idx])
+                result_v.append(chunk_v[max_idx])
+                result_t.append(chunk_t[min_idx])
+                result_v.append(chunk_v[min_idx])
+
+        return np.array(result_t), np.array(result_v)
+
     def _update_plot(self):
-        """Update plot with current data."""
-        # When paused, don't update the plot at all - freeze everything
-        if self.plot_paused:
-            return
+        """Update plot with current data using numpy for performance."""
         # X axis always starts at 0, ends at time_window
-        # Data is shifted so newest point is at time_window
         dpg.set_axis_limits("x_axis", 0, self.time_window)
 
         # Track min/max for Y axis auto-scaling
@@ -1453,6 +1546,11 @@ class DragoonPlotApp:
 
         # Update each channel
         num_channels = max(len(self.channel_configs), self.data_buffer.get_channel_count())
+        # Use frozen time when paused, otherwise current time
+        if self.plot_paused and hasattr(self, 'paused_time'):
+            current_time = self.paused_time
+        else:
+            current_time = time.time() - self.data_buffer.start_time
 
         for i in range(num_channels):
             series_tag = f"series_{i}"
@@ -1463,40 +1561,47 @@ class DragoonPlotApp:
             cfg = self.channel_configs[i]
             timestamps, values = self.data_buffer.get_data(i)
 
-            # Shift timestamps so newest data is at time_window, oldest at 0
-            # This makes the graph scroll with 0 always on the left
-            current_time = time.time() - self.data_buffer.start_time
-            timestamps = [self.time_window - (current_time - t) for t in timestamps]
+            if len(timestamps) == 0:
+                if dpg.does_item_exist(series_tag):
+                    dpg.configure_item(series_tag, show=False)
+                continue
 
-            # Apply scale and offset
-            values = [v * cfg.scale + cfg.offset for v in values]
+            # Shift timestamps so newest data is at time_window (numpy vectorized)
+            timestamps = self.time_window - (current_time - timestamps)
 
-            # Filter to only visible data (within time window)
-            visible_values = [v for t, v in zip(timestamps, values) if 0 <= t <= self.time_window]
+            # Apply scale and offset (numpy vectorized)
+            values = values * cfg.scale + cfg.offset
 
-            # Update Y axis bounds from visible data (based on checkbox visibility)
-            if cfg.visible and visible_values:
-                ch_min = min(visible_values)
-                ch_max = max(visible_values)
+            # Filter to visible time window
+            mask = (timestamps >= 0) & (timestamps <= self.time_window)
+            visible_t = timestamps[mask]
+            visible_v = values[mask]
+
+            # Update Y axis bounds from visible data
+            if cfg.visible and len(visible_v) > 0:
+                ch_min = np.min(visible_v)
+                ch_max = np.max(visible_v)
                 y_min = min(y_min, ch_min)
                 y_max = max(y_max, ch_max)
                 has_visible_data = True
 
+            # Downsample for display performance
+            plot_t, plot_v = self._downsample_minmax(visible_t, visible_v)
+
             # Check if series exists
             if dpg.does_item_exist(series_tag):
-                if cfg.visible and timestamps:
-                    dpg.set_value(series_tag, [timestamps, values])
+                if cfg.visible and len(plot_t) > 0:
+                    dpg.set_value(series_tag, [plot_t.tolist(), plot_v.tolist()])
                     dpg.configure_item(series_tag, label=cfg.name or f"Ch{i}", show=True)
                     # Update theme in case color changed
                     dpg.bind_item_theme(series_tag, self._create_line_theme(cfg.color))
                 else:
-                    # Checkbox unchecked or no data - hide
                     dpg.configure_item(series_tag, show=False)
             else:
-                if timestamps and cfg.visible:
+                if len(plot_t) > 0 and cfg.visible:
                     dpg.add_line_series(
-                        timestamps,
-                        values,
+                        plot_t.tolist(),
+                        plot_v.tolist(),
                         label=cfg.name or f"Ch{i}",
                         tag=series_tag,
                         parent="y_axis",
@@ -1525,6 +1630,9 @@ class DragoonPlotApp:
         last_channel_count = 0
 
         while dpg.is_dearpygui_running():
+            # Process serial data batch (replaces per-frame callbacks)
+            self._process_serial_batch()
+
             self._update_plot()
 
             # Check if mouse is over splitter
