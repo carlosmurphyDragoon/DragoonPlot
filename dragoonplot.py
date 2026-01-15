@@ -870,6 +870,7 @@ class DragoonPlotApp:
         if dpg.does_item_exist("terminal_scroll_container"):
             try:
                 dpg.set_y_scroll("terminal_scroll_container", 0)
+                dpg.set_x_scroll("terminal_scroll_container", 0)  # Reset horizontal scroll too
             except Exception:
                 pass
 
@@ -905,6 +906,7 @@ class DragoonPlotApp:
             try:
                 max_scroll = dpg.get_y_scroll_max("terminal_scroll_container")
                 dpg.set_y_scroll("terminal_scroll_container", max_scroll)
+                dpg.set_x_scroll("terminal_scroll_container", 0)  # Keep left-justified
             except Exception:
                 pass
 
