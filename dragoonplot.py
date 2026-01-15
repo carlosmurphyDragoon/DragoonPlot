@@ -898,15 +898,33 @@ class DragoonPlotApp:
             first_newline = new_text.find('\n')
             if first_newline > 0:
                 new_text = new_text[first_newline + 1:]
+        # Save scroll position before updating text (for when auto-scroll is off)
+        saved_y_scroll = 0
+        auto_scroll_enabled = dpg.does_item_exist("terminal_autoscroll") and dpg.get_value("terminal_autoscroll")
+        if not auto_scroll_enabled:
+            try:
+                saved_y_scroll = dpg.get_y_scroll("terminal_scroll_container")
+            except Exception:
+                pass
+
         dpg.set_value("terminal_output", new_text)
 
-        # Auto-scroll to bottom if enabled
-        if dpg.does_item_exist("terminal_autoscroll") and dpg.get_value("terminal_autoscroll"):
-            # Scroll the child_window container to bottom
+        # Always keep terminal left-justified
+        try:
+            dpg.set_x_scroll("terminal_scroll_container", 0)
+        except Exception:
+            pass
+
+        # Auto-scroll to bottom if enabled, otherwise restore scroll position
+        if auto_scroll_enabled:
             try:
                 max_scroll = dpg.get_y_scroll_max("terminal_scroll_container")
                 dpg.set_y_scroll("terminal_scroll_container", max_scroll)
-                dpg.set_x_scroll("terminal_scroll_container", 0)  # Keep left-justified
+            except Exception:
+                pass
+        else:
+            try:
+                dpg.set_y_scroll("terminal_scroll_container", saved_y_scroll)
             except Exception:
                 pass
 
