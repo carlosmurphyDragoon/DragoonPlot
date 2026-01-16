@@ -1070,29 +1070,21 @@ class DragoonPlotApp:
             # Group buttons by category
             categories = {}
             uncategorized = []
+            cat_order = []  # Build order dynamically from parsed commands
             for i, btn in enumerate(self.command_buttons):
                 if btn.category:
                     if btn.category not in categories:
                         categories[btn.category] = []
+                        cat_order.append(btn.category)  # Track order of first appearance
                     categories[btn.category].append((i, btn))
                 else:
                     uncategorized.append((i, btn))
 
-            # Category display names and order
-            cat_names = {
-                "state": "State",
-                "diag": "Diagnostics",
-                "param": "Parameters",
-                "sys": "System"
-            }
-            cat_order = ["state", "diag", "param", "sys"]
-
-            # Render categorized buttons
+            # Render categorized buttons (using verbatim category names)
             for cat in cat_order:
                 if cat in categories:
-                    # Category header
-                    dpg.add_text(cat_names.get(cat, cat.capitalize()),
-                                color=(150, 200, 255), parent="cmd_buttons_group")
+                    # Category header - use verbatim name from device
+                    dpg.add_text(cat, color=(150, 200, 255), parent="cmd_buttons_group")
                     # Buttons in a horizontal flow
                     with dpg.group(horizontal=True, parent="cmd_buttons_group"):
                         for i, btn in categories[cat]:
@@ -1648,8 +1640,17 @@ class DragoonPlotApp:
     def run(self):
         """Main application loop."""
         last_channel_count = 0
+        terminal_initialized = False
 
         while dpg.is_dearpygui_running():
+            # Initialize terminal scroll position on first frame
+            if not terminal_initialized:
+                try:
+                    dpg.set_x_scroll("terminal_scroll_container", 0)
+                except Exception:
+                    pass
+                terminal_initialized = True
+
             # Process serial data batch (replaces per-frame callbacks)
             self._process_serial_batch()
 
