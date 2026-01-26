@@ -1690,6 +1690,12 @@ class DragoonPlotApp:
             self._process_terminal_queue()
             self._process_dfu_queue()
 
+            # Keep terminal left-justified on resize (reset horizontal scroll every frame)
+            try:
+                dpg.set_x_scroll("terminal_scroll_container", 0)
+            except Exception:
+                pass
+
             dpg.render_dearpygui_frame()
 
         self.serial_manager.disconnect()
