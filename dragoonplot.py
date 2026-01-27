@@ -169,9 +169,9 @@ def get_resource_path(relative_path: str) -> str:
 # === Constants ===
 START_DATA = 0xAA
 START_LABEL = 0xAB
-MAX_CHANNELS = 32
+MAX_CHANNELS = 64
 MAX_LABEL_LEN = 16
-BUFFER_SIZE = 10000
+BUFFER_SIZE = 20000
 DEFAULT_TIME_WINDOW = 10.0
 CONFIG_FILE = Path.home() / ".dragoonplot.json"
 BAUD_RATES = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
