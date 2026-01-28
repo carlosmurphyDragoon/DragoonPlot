@@ -866,13 +866,6 @@ class DragoonPlotApp:
         """Clear the terminal output."""
         if dpg.does_item_exist("terminal_output"):
             dpg.set_value("terminal_output", "")
-        # Reset scroll position to top
-        if dpg.does_item_exist("terminal_scroll_container"):
-            try:
-                dpg.set_y_scroll("terminal_scroll_container", 0)
-                dpg.set_x_scroll("terminal_scroll_container", 0)  # Reset horizontal scroll too
-            except Exception:
-                pass
 
     def _process_terminal_queue(self):
         """Process queued terminal output (must be called from main thread)."""
@@ -898,33 +891,22 @@ class DragoonPlotApp:
             first_newline = new_text.find('\n')
             if first_newline > 0:
                 new_text = new_text[first_newline + 1:]
-        # Save scroll position before updating text (for when auto-scroll is off)
-        saved_y_scroll = 0
-        auto_scroll_enabled = dpg.does_item_exist("terminal_autoscroll") and dpg.get_value("terminal_autoscroll")
-        if not auto_scroll_enabled:
-            try:
-                saved_y_scroll = dpg.get_y_scroll("terminal_scroll_container")
-            except Exception:
-                pass
 
         dpg.set_value("terminal_output", new_text)
 
-        # Always keep terminal left-justified
-        try:
-            dpg.set_x_scroll("terminal_scroll_container", 0)
-        except Exception:
-            pass
+        # Resize input_text height based on line count so child_window can scroll
+        line_count = new_text.count('\n') + 1
+        line_height = 18 * self.ui_scale  # Approximate line height
+        min_height = 100
+        new_height = max(min_height, int(line_count * line_height))
+        dpg.configure_item("terminal_output", height=new_height)
 
-        # Auto-scroll to bottom if enabled, otherwise restore scroll position
+        # Auto-scroll to bottom via child_window
+        auto_scroll_enabled = dpg.does_item_exist("terminal_autoscroll") and dpg.get_value("terminal_autoscroll")
         if auto_scroll_enabled:
             try:
                 max_scroll = dpg.get_y_scroll_max("terminal_scroll_container")
                 dpg.set_y_scroll("terminal_scroll_container", max_scroll)
-            except Exception:
-                pass
-        else:
-            try:
-                dpg.set_y_scroll("terminal_scroll_container", saved_y_scroll)
             except Exception:
                 pass
 
@@ -1379,13 +1361,15 @@ class DragoonPlotApp:
                         with dpg.group(horizontal=True):
                             dpg.add_button(label="Clear", callback=self._clear_terminal, width=sz(60))
                             dpg.add_checkbox(label="Auto-scroll", tag="terminal_autoscroll", default_value=True)
-                        with dpg.child_window(tag="terminal_scroll_container", height=-1, width=-1, horizontal_scrollbar=False):
-                            dpg.add_text(
+                        with dpg.child_window(tag="terminal_scroll_container", height=-1, width=-1, horizontal_scrollbar=True):
+                            dpg.add_input_text(
                                 tag="terminal_output",
                                 default_value="",
-                                tracked=True,
-                                track_offset=1.0,  # Track at bottom
-                                wrap=-1,  # Wrap to parent container width
+                                multiline=True,
+                                readonly=True,
+                                height=100,  # Will grow dynamically based on content
+                                width=-1,
+                                tab_input=False,
                             )
 
                     # DFU tab
@@ -1640,17 +1624,8 @@ class DragoonPlotApp:
     def run(self):
         """Main application loop."""
         last_channel_count = 0
-        terminal_initialized = False
 
         while dpg.is_dearpygui_running():
-            # Initialize terminal scroll position on first frame
-            if not terminal_initialized:
-                try:
-                    dpg.set_x_scroll("terminal_scroll_container", 0)
-                except Exception:
-                    pass
-                terminal_initialized = True
-
             # Process serial data batch (replaces per-frame callbacks)
             self._process_serial_batch()
 
@@ -1689,12 +1664,6 @@ class DragoonPlotApp:
             # Process terminal output queue (thread-safe GUI updates)
             self._process_terminal_queue()
             self._process_dfu_queue()
-
-            # Keep terminal left-justified on resize (reset horizontal scroll every frame)
-            try:
-                dpg.set_x_scroll("terminal_scroll_container", 0)
-            except Exception:
-                pass
 
             dpg.render_dearpygui_frame()
 
