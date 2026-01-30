@@ -1041,6 +1041,16 @@ class DragoonPlotApp:
             data = button.data.encode('utf-8')
         self.serial_manager.send(data)
 
+    def _send_terminal_input(self, sender=None, app_data=None):
+        """Send text from the terminal input box."""
+        if not self.serial_manager.is_connected():
+            return
+        text = dpg.get_value("terminal_input")
+        if text:
+            data = f"{text}\r\n".encode('utf-8')
+            self.serial_manager.send(data)
+            dpg.set_value("terminal_input", "")
+
     def _sz(self, value: int) -> int:
         """Scale a size value by the UI scale factor."""
         return int(value * self.ui_scale)
@@ -1361,7 +1371,7 @@ class DragoonPlotApp:
                         with dpg.group(horizontal=True):
                             dpg.add_button(label="Clear", callback=self._clear_terminal, width=sz(60))
                             dpg.add_checkbox(label="Auto-scroll", tag="terminal_autoscroll", default_value=True)
-                        with dpg.child_window(tag="terminal_scroll_container", height=-1, width=-1, horizontal_scrollbar=True):
+                        with dpg.child_window(tag="terminal_scroll_container", height=-sz(30), width=-1, horizontal_scrollbar=True):
                             dpg.add_input_text(
                                 tag="terminal_output",
                                 default_value="",
@@ -1371,6 +1381,15 @@ class DragoonPlotApp:
                                 width=-1,
                                 tab_input=False,
                             )
+                        with dpg.group(horizontal=True):
+                            dpg.add_input_text(
+                                tag="terminal_input",
+                                hint="Type command...",
+                                width=-sz(60),
+                                on_enter=True,
+                                callback=self._send_terminal_input,
+                            )
+                            dpg.add_button(label="Send", callback=self._send_terminal_input, width=sz(50))
 
                     # DFU tab
                     with dpg.tab(label="DFU", tag="dfu_tab"):
